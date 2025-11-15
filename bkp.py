@@ -1913,17 +1913,37 @@ def train_xgboost(
     # Step 3: Train with early stopping
     logger.info("Step 3: Training XGBoost with early stopping on validation set")
     try:
-        xgb.fit(
-            X_train,
-            y_train,
-            eval_set=[(X_val, y_val)],
-            early_stopping_rounds=50,
-            verbose=False
-        )
-        logger.info(
-            f"XGBoost training complete: best iteration={xgb.best_iteration} "
-            f"with val AUC={xgb.best_score:.4f}"
-        )
+        # Try newer XGBoost API (2.0+) with callbacks
+        try:
+            from xgboost import early_stopping
+            logger.info("Using XGBoost 2.0+ callbacks API for early stopping")
+            xgb.fit(
+                X_train,
+                y_train,
+                eval_set=[(X_val, y_val)],
+                callbacks=[early_stopping(rounds=50, metric_name='logloss')],
+                verbose=False
+            )
+        except (ImportError, TypeError) as e_new:
+            # Fallback to older XGBoost API
+            logger.info(f"XGBoost 2.0+ API failed ({type(e_new).__name__}); trying older API")
+            xgb.fit(
+                X_train,
+                y_train,
+                eval_set=[(X_val, y_val)],
+                early_stopping_rounds=50,
+                verbose=False
+            )
+
+        # Log training completion
+        if hasattr(xgb, 'best_iteration'):
+            logger.info(
+                f"XGBoost training complete: best iteration={xgb.best_iteration} "
+                f"with val AUC={xgb.best_score:.4f}"
+            )
+        else:
+            logger.info(f"XGBoost training complete with {xgb.n_estimators} estimators")
+
     except Exception as e:
         logger.error(f"XGBoost training failed: {e}", exc_info=True)
         return None
