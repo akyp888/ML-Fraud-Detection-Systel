@@ -1130,17 +1130,28 @@ def resample_training_data(
     cfg: Config,
 ):
     """
-    Apply advanced imbalance handling if imbalanced-learn is available.
+    Apply advanced imbalance handling with adaptive k_neighbors for small minority classes.
 
     Preferred: SMOTE-Tomek with BorderlineSMOTE (focusing on decision boundary).
-    Fallbacks:
-        - Manual BorderlineSMOTE + TomekLinks (when the new imblearn API rejects BorderlineSMOTE)
-        - Standard SMOTE-Tomek
-        - Return original data if imblearn pieces are unavailable
+    Features:
+        - Adaptive k_neighbors: Reduces k_neighbors when minority samples are very few
+        - Fallbacks for small minority classes
+        - Pure SMOTE if TomekLinks fails
     """
 
     if not cfg.use_smote_tomek:
         logger.info("SMOTE-Tomek disabled via config; using original training data")
+        return X_train, y_train
+
+    n_minority = int(y_train.sum())
+    logger.info(f"Training data: {len(X_train)} total, {n_minority} fraud (minority)")
+
+    # Adaptive k_neighbors for extremely small minority classes
+    k_neighbors = max(1, min(5, n_minority - 1)) if n_minority > 1 else 1
+    logger.info(f"Using adaptive k_neighbors={k_neighbors} (for {n_minority} minority samples)")
+
+    if n_minority < 2:
+        logger.warning(f"Very few fraud cases ({n_minority}); cannot apply SMOTE")
         return X_train, y_train
 
     smote_kind = (cfg.smote_kind or "regular").lower()
@@ -1154,53 +1165,54 @@ def resample_training_data(
         return X, y
 
     def _apply_borderline_then_tomek():
-        sampler = BorderlineSMOTE(
-            random_state=cfg.random_state,
-            kind="borderline-1",
-        )
-        X_smote, y_smote = sampler.fit_resample(X_train, y_train)
-        if TomekLinks is not None:
-            tomek = TomekLinks()
-            X_clean, y_clean = tomek.fit_resample(X_smote, y_smote)
-            return _log_and_return(X_clean, y_clean, "BorderlineSMOTE + TomekLinks")
-        logger.info("TomekLinks unavailable; returning BorderlineSMOTE-only resampled data")
-        return _log_and_return(X_smote, y_smote, "BorderlineSMOTE")
+        try:
+            sampler = BorderlineSMOTE(
+                k_neighbors=k_neighbors,
+                random_state=cfg.random_state,
+                kind="borderline-1",
+            )
+            X_smote, y_smote = sampler.fit_resample(X_train, y_train)
+            if TomekLinks is not None:
+                tomek = TomekLinks()
+                X_clean, y_clean = tomek.fit_resample(X_smote, y_smote)
+                return _log_and_return(X_clean, y_clean, "BorderlineSMOTE + TomekLinks")
+            logger.info("TomekLinks unavailable; returning BorderlineSMOTE-only resampled data")
+            return _log_and_return(X_smote, y_smote, "BorderlineSMOTE")
+        except Exception as e:
+            logger.warning(f"BorderlineSMOTE failed ({e}); falling back to pure SMOTE")
+            return None
 
     if smote_kind == "borderline" and has_borderline:
-        logger.info("Applying BorderlineSMOTE-focused resampling...")
-        if SMOTETomek is not None and SMOTE is not None:
-            try:
-                if issubclass(BorderlineSMOTE, SMOTE):
-                    sampler = SMOTETomek(
-                        random_state=cfg.random_state,
-                        smote=BorderlineSMOTE(
-                            random_state=cfg.random_state,
-                            kind="borderline-1",
-                        ),
-                    )
-                    X_res, y_res = sampler.fit_resample(X_train, y_train)
-                    return _log_and_return(X_res, y_res, "SMOTETomek (Borderline)")
-            except TypeError:
-                # Some imblearn versions wrap SMOTE with special typing objects
-                pass
-        if BorderlineSMOTE is not None:
-            return _apply_borderline_then_tomek()
-        logger.info("BorderlineSMOTE unavailable; falling back to standard SMOTE-Tomek")
+        logger.info("Attempting BorderlineSMOTE-focused resampling...")
+        result = _apply_borderline_then_tomek()
+        if result is not None:
+            return result
+        logger.info("Fallback: Using pure SMOTE with adaptive k_neighbors")
 
     if SMOTETomek is None:
-        logger.info("SMOTETomek not available; using original training data")
+        logger.info("SMOTETomek not available; trying pure SMOTE")
+        if SMOTE is None:
+            logger.warning("SMOTE not available; using original training data")
+            return X_train, y_train
+
+    # Try pure SMOTE first
+    try:
+        logger.info(f"Applying pure SMOTE with k_neighbors={k_neighbors}...")
+        smote_estimator = SMOTE(k_neighbors=k_neighbors, random_state=cfg.random_state)
+        X_res, y_res = smote_estimator.fit_resample(X_train, y_train)
+        return _log_and_return(X_res, y_res, "SMOTE")
+    except Exception as e:
+        logger.warning(f"Pure SMOTE failed ({e}); trying RandomOverSampler as fallback")
+
+    # Last resort: Simple random oversampling
+    try:
+        from imblearn.over_sampling import RandomOverSampler
+        sampler = RandomOverSampler(random_state=cfg.random_state)
+        X_res, y_res = sampler.fit_resample(X_train, y_train)
+        return _log_and_return(X_res, y_res, "RandomOverSampler")
+    except Exception as e:
+        logger.warning(f"RandomOverSampler failed ({e}); returning original training data")
         return X_train, y_train
-
-    smote_estimator = None
-    if SMOTE is not None:
-        smote_estimator = SMOTE(random_state=cfg.random_state)
-
-    sampler = SMOTETomek(
-        random_state=cfg.random_state,
-        smote=smote_estimator,
-    )
-    X_res, y_res = sampler.fit_resample(X_train, y_train)
-    return _log_and_return(X_res, y_res, "SMOTETomek")
 
 
 # ------------------------------------------------------------------------------
@@ -1430,14 +1442,36 @@ def train_lightgbm(
         n_jobs=-1,
     )
 
-    lgbm.fit(
-        X_train,
-        y_train,
-        eval_set=[(X_val, y_val)],
-        eval_metric="auc",
-        early_stopping_rounds=50,
-        verbose=False,
-    )
+    try:
+        # Try newer LightGBM API with callbacks
+        from lightgbm import early_stopping
+        lgbm.fit(
+            X_train,
+            y_train,
+            eval_set=[(X_val, y_val)],
+            eval_metric="auc",
+            callbacks=[early_stopping(50)],
+            verbose=False,
+        )
+    except (ImportError, TypeError):
+        # Fallback to older API or direct fit without early stopping
+        try:
+            lgbm.fit(
+                X_train,
+                y_train,
+                eval_set=[(X_val, y_val)],
+                eval_metric="auc",
+                early_stopping_rounds=50,
+                verbose=False,
+            )
+        except TypeError:
+            # If early_stopping_rounds not supported, train without it
+            logger.warning("Early stopping not supported in this LightGBM version; training without")
+            lgbm.fit(
+                X_train,
+                y_train,
+                verbose=False,
+            )
     return lgbm
 
 
