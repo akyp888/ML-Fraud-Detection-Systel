@@ -220,7 +220,7 @@ def build_preprocessor(
         ]
     )
 
-    # Configure OneHotEncoder with dense output and min_frequency if available
+    # Configure OneHotEncoder with sparse output to avoid memory issues
     ohe_kwargs: Dict[str, Any] = {"handle_unknown": "ignore"}
     from inspect import signature
     sig = signature(OneHotEncoder.__init__).parameters
@@ -228,9 +228,9 @@ def build_preprocessor(
         # avoid exploding dimension with ultra-rare categories
         ohe_kwargs["min_frequency"] = 10
     if "sparse_output" in sig:
-        ohe_kwargs["sparse_output"] = False
+        ohe_kwargs["sparse_output"] = True
     elif "sparse" in sig:
-        ohe_kwargs["sparse"] = False
+        ohe_kwargs["sparse"] = True
 
     categorical_transformer = Pipeline(
         steps=[

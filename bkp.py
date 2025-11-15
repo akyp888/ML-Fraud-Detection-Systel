@@ -105,7 +105,7 @@ class Config:
 
     # Columns (these should match your real schema if present)
     label_col: str = "label"
-    ecm_label_col: str = "FRAUD_STATE"   # column in ECM table to derive label from
+    ecm_label_col: str = "RESULT_TYPE_CD"   # column in ECM table to derive label from
     trx_id_col: str = "CORRELATIVE_NO"
     customer_col: str = "CUSTOMER_NO"
     account_col: str = "ACCOUNT_NO"
@@ -265,7 +265,7 @@ def make_data_messy(
             weird_mask = rng.rand(len(df_trx)) < 0.02  # 2%
             df_trx.loc[weird_mask, col] = "ZZZ_UNKNOWN_" + col
 
-    # 4. Mutate FRAUD_STATE strings (mixed case, synonyms)
+    # 4. Mutate ECM label strings (mixed case, synonyms)
     if cfg.ecm_label_col in df_ecm.columns:
         ecm = df_ecm[cfg.ecm_label_col].astype(str)
         # introduce some noise
