@@ -1843,7 +1843,6 @@ def tune_xgboost_params(X: np.ndarray, y: np.ndarray, sample_size: int = 5000, c
     xgb_est = XGBClassifier(
         objective="binary:logistic",
         eval_metric="auc",
-        use_label_encoder=False,
         n_estimators=100,
         n_jobs=-1,
         random_state=42,
@@ -1903,7 +1902,6 @@ def train_xgboost(
     xgb_params = {
         "objective": "binary:logistic",
         "eval_metric": "auc",
-        "use_label_encoder": False,
         "n_jobs": -1,
         "scale_pos_weight": scale_pos_weight,  # Handle class imbalance
         "random_state": cfg.random_state,
