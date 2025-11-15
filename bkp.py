@@ -407,16 +407,19 @@ def merge_trx_and_ecm(
     merged = df_trx.merge(df_ecm, on=cfg.trx_id_col, how="left", suffixes=("", "_ECM"))
     logger.info(f"Merged shape: {merged.shape[0]} rows, {merged.shape[1]} columns")
 
-    # Create label
-    if cfg.ecm_label_col not in merged.columns:
-        raise KeyError(f"ECM label column {cfg.ecm_label_col} not found in merged data")
-
-    label_series = merged[cfg.ecm_label_col].astype(str).str.upper().str.strip()
-    is_fraud = label_series.str.contains("FRAUD")
-    is_genuine = label_series.str.contains("GENUINE") | label_series.str.contains("LEGIT")
-
-    # Default: unknown/other treated as non-fraud (can be tuned)
-    merged[cfg.label_col] = np.where(is_fraud, 1, 0)
+    # Create label from FRAUD_IND (if available) or fall back to ECM label column
+    if "FRAUD_IND" in merged.columns:
+        # Use the true fraud indicator from transactions (not corrupted by make_data_messy)
+        label_series = merged["FRAUD_IND"].astype(str).str.strip()
+        merged[cfg.label_col] = np.where(label_series.isin(["1", "true", "True", "TRUE"]), 1, 0)
+    elif cfg.ecm_label_col in merged.columns:
+        # Fallback to ECM label if FRAUD_IND not available
+        label_series = merged[cfg.ecm_label_col].astype(str).str.upper().str.strip()
+        is_fraud = label_series.str.contains("FRAUD")
+        is_genuine = label_series.str.contains("GENUINE") | label_series.str.contains("LEGIT")
+        merged[cfg.label_col] = np.where(is_fraud, 1, 0)
+    else:
+        raise KeyError(f"Neither FRAUD_IND nor {cfg.ecm_label_col} found in merged data")
 
     logger.info(
         f"Label distribution after merge: "
@@ -426,6 +429,7 @@ def merge_trx_and_ecm(
 
     # Drop outcome/ECM fields that would leak the label
     leak_cols = [
+        "FRAUD_IND",  # True fraud indicator (would leak the label)
         cfg.ecm_label_col,
         "RESULT_TYPE_CD",
         "SUBTYPE_RESULT_CD",
