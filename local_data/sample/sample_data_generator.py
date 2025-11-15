@@ -816,15 +816,51 @@ def generate_datasets(
     out_dir: Path,
     seed: int = 42,
 ) -> None:
+    """
+    Generate transactions.jsonl and ecm.jsonl with a *controlled* fraud rate.
+
+    - We first choose exactly ~n_transactions * fraud_ratio indices to be fraud.
+    - For those indices, FRAUD_IND = "1"; others get "0".
+    - All the risk features (new device, new IP, night-time, international, etc.)
+      are still generated and used to drive alerts and ECM outcomes, but they no
+      longer distort the global fraud ratio.
+    """
+    if fraud_ratio < 0:
+        raise ValueError(f"fraud_ratio must be >= 0, got {fraud_ratio}")
+
     random.seed(seed)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     trx_path = out_dir / "transactions.jsonl"
     ecm_path = out_dir / "ecm.jsonl"
 
-    trimmed_ratio = min(max(fraud_ratio, 1e-4), 0.95)
-    base_logit = math.log(trimmed_ratio / (1 - trimmed_ratio))
+    # ------------------------------------------------------------------
+    # 1. Decide how many rows will be fraud and which indices they are.
+    # ------------------------------------------------------------------
+    if fraud_ratio == 0:
+        n_fraud_target = 0
+    else:
+        # Round to nearest integer and ensure at least 1 fraud if ratio > 0
+        n_fraud_target = int(round(n_transactions * fraud_ratio))
+        if n_fraud_target == 0:
+            n_fraud_target = 1
 
+    n_fraud_target = min(n_fraud_target, n_transactions)
+
+    if n_fraud_target > 0:
+        fraud_indices = set(random.sample(range(n_transactions), n_fraud_target))
+    else:
+        fraud_indices = set()
+
+    print(f"[INFO] Generating {n_transactions} transactions (target fraud ratio ≈ {fraud_ratio:.6f})")
+    print(
+        f"[INFO] Target fraud rows: {n_fraud_target} "
+        f"({(n_fraud_target / n_transactions):.4%})"
+    )
+
+    # ------------------------------------------------------------------
+    # 2. Build customers / destinations (same as before)
+    # ------------------------------------------------------------------
     n_customers = max(200, n_transactions // 5)
     n_destinations = max(100, n_transactions // 10)
     device_registry: Dict[str, Dict[str, str]] = {}
@@ -842,24 +878,29 @@ def generate_datasets(
         for cust in customers
     }
 
-    print(f"[INFO] Generating {n_transactions} transactions (target fraud ratio ≈ {fraud_ratio:.6f})")
-
     trx_fields = list(TRX_FIELD_TYPES.keys())
     ecm_fields = list(ECM_FIELD_TYPES.keys())
 
     observed_fraud = 0
 
+    # ------------------------------------------------------------------
+    # 3. Main generation loop
+    # ------------------------------------------------------------------
     with trx_path.open("w", encoding="utf-8") as f_trx, ecm_path.open("w", encoding="utf-8") as f_ecm:
         for i in range(n_transactions):
             profile = random.choice(customers)
             history = customer_history[profile["customer_no"]]
             account_no = random.choice(profile["accounts"])
 
-            device_id, device_meta, is_new_device = select_device_for_customer(profile, history, device_registry)
+            # Device / IP / contact info
+            device_id, device_meta, is_new_device = select_device_for_customer(
+                profile, history, device_registry
+            )
             ip_address, is_new_ip = select_ip_for_customer(profile, history)
             phone = random.choice(profile["phones"])
             email = random.choice(profile["emails"])
 
+            # Destination account (some will be international)
             dest = random.choices(dest_accounts, weights=dest_weights, k=1)[0]
             if dest["country"] == profile["home_country"] and random.random() < profile["intl_propensity"]:
                 intl_options = [d for d in dest_accounts if d["country"] != profile["home_country"]]
@@ -869,10 +910,12 @@ def generate_datasets(
             is_new_dest = dest["account_no"] not in history["seen_destinations"]
             history["seen_destinations"].add(dest["account_no"])
 
+            # Transaction datetime
             trx_dt = sample_transaction_datetime(profile["night_owl_prob"])
             trx_date_int = int(trx_dt.strftime("%Y%m%d"))
             trx_hour = trx_dt.hour
 
+            # Amount / FX
             currency = profile["preferred_currency"]
             raw_amount = math.exp(random.gauss(profile["amount_mu"], 0.8)) - 1.0
             amount = round(max(5.0, raw_amount), 2)
@@ -883,32 +926,21 @@ def generate_datasets(
                 exchange_rate = random.uniform(3700, 4300)
                 usd_amount = round(amount / exchange_rate, 2)
 
+            # Risk signals used for alerts (but no longer for the label itself)
             log_amount_centered = math.log1p(amount) - 9.0
             is_night = trx_hour < 6 or trx_hour >= 23
             is_international = dest["country"] != profile["home_country"]
-            has_prior_fraud = history["fraud_count"] > 0
 
-            z = (
-                base_logit
-                + 0.8 * log_amount_centered
-                + 1.1 * int(is_new_device)
-                + 0.7 * int(is_new_ip)
-                + 0.9 * int(is_new_dest)
-                + 0.5 * int(is_night)
-                + 0.6 * int(is_international)
-                + 1.0 * int(has_prior_fraud)
-                + 0.6 * (dest["risk_score"] - 0.5)
-                + random.gauss(0, 0.8)
-            )
-            fraud_prob = sigmoid(z)
-            is_fraud = random.random() < fraud_prob
-            if (n_transactions - i) == 1 and observed_fraud == 0:
-                is_fraud = True
+            # --------------------------
+            # LABEL: use pre-selected set
+            # --------------------------
+            is_fraud = i in fraud_indices
 
             if is_fraud:
                 history["fraud_count"] += 1
                 observed_fraud += 1
 
+            # Alert score and ECM-ish behaviour still based on risk features
             alert_score = clip01(
                 0.4
                 + 0.25 * int(is_new_device)
@@ -937,21 +969,29 @@ def generate_datasets(
                 reasons.append("Risk score extremely high")
             alert_text = pick_alert_text(reasons, alert_triggered)
 
+            # ECM outcome tied to both alert + true fraud
             if alert_triggered:
                 if is_fraud:
-                    result_type = random.choices(["FRAUD", "GENUINE"], weights=[0.8, 0.2])[0]
+                    result_type = random.choices(
+                        ["FRAUD", "GENUINE"], weights=[0.8, 0.2]
+                    )[0]
                 else:
-                    result_type = random.choices(["GENUINE", "FRAUD"], weights=[0.95, 0.05])[0]
+                    result_type = random.choices(
+                        ["GENUINE", "FRAUD"], weights=[0.95, 0.05]
+                    )[0]
             else:
                 result_type = "GENUINE"
 
             trx_ind = "ALERTED" if alert_triggered else "NO_ALERT"
             if random.random() < 0.05:
                 trx_ind = "ALERTED" if trx_ind == "NO_ALERT" else "NO_ALERT"
+
             correction_ind = "Y" if (result_type == "FRAUD" and not is_fraud and random.random() < 0.7) else "N"
             subtype = random.choice(["INVESTIGATE", "CLOSED", "ESCALATED", "DISMISSED"])
 
             channel = choose_channel(profile)
+
+            # Context for fields that need consistent values
             trx_context = {
                 "CUSTOMER_NO": profile["customer_no"],
                 "CLIENT_NO": profile["client_no"],
@@ -1012,11 +1052,13 @@ def generate_datasets(
                 "ALERT_CONDITIONS_TEXT": alert_text,
             }
 
+            # Build full TRX row
             trx_row: Dict[str, Any] = {}
             for field in trx_fields:
                 type_label = TRX_FIELD_TYPES[field]
                 trx_row[field] = generate_trx_value(field, type_label, is_fraud, i, trx_context)
 
+            # Build full ECM row
             ecm_row: Dict[str, Any] = {}
             for field in ecm_fields:
                 type_label = ECM_FIELD_TYPES[field]
@@ -1025,11 +1067,10 @@ def generate_datasets(
             f_trx.write(json.dumps(trx_row, ensure_ascii=False) + "\n")
             f_ecm.write(json.dumps(ecm_row, ensure_ascii=False) + "\n")
 
-    observed_ratio = observed_fraud / n_transactions
+    observed_ratio = observed_fraud / n_transactions if n_transactions > 0 else 0.0
     print(f"[INFO] Wrote transactions to: {trx_path}")
     print(f"[INFO] Wrote ECM records to:  {ecm_path}")
     print(f"[INFO] Observed fraud rows: {observed_fraud} ({observed_ratio:.4%})")
-
 
 # ---------------------------------------------------------------------------
 # 5. CLI
