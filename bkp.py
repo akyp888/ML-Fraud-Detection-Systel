@@ -724,6 +724,14 @@ def resample_train_val_combined_after_encoding(
         f"  Resampled fraud distribution: {int(y_resampled.sum())} fraud, {int((y_resampled == 0).sum())} non-fraud"
     )
 
+    # Shuffle resampled data before re-splitting
+    # SMOTE generates synthetic samples at the end, causing all fraud to end up in one split
+    # Shuffling ensures fraud cases are distributed across train and val
+    shuffle_idx = np.random.RandomState(cfg.random_state).permutation(new_total_size)
+    X_resampled = X_resampled[shuffle_idx]
+    y_resampled = y_resampled[shuffle_idx]
+    logger.info(f"  Shuffled resampled data to distribute fraud cases evenly")
+
     # Re-split back into train/val using original proportions
     # Calculate train/val split point based on original proportions
     train_fraction = original_train_size / total_size
