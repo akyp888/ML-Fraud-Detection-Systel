@@ -43,23 +43,19 @@ from typing import List, Tuple, Dict, Optional, Any
 import numpy as np
 import pandas as pd
 
-from sklearn.model_selection import train_test_split, StratifiedKFold, GridSearchCV, cross_val_score
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     roc_auc_score,
     average_precision_score,
     f1_score,
     precision_recall_curve,
     classification_report,
-    confusion_matrix,
-    precision_score,
-    recall_score,
 )
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.preprocessing import OneHotEncoder
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.feature_selection import SelectFromModel, mutual_info_classif
 
 # Optional dependencies --------------------------------------------------------
 try:
@@ -81,12 +77,6 @@ except Exception:
     BorderlineSMOTE = None
     SMOTE = None
     TomekLinks = None
-
-try:
-    import shap  # type: ignore
-    SHAP_AVAILABLE = True
-except Exception:
-    SHAP_AVAILABLE = False
 
 # ------------------------------------------------------------------------------
 # Logging configuration
@@ -1253,183 +1243,6 @@ def resample_training_data(
 
 
 # ------------------------------------------------------------------------------
-# Feature selection and importance ranking
-# ------------------------------------------------------------------------------
-
-def select_important_features(
-    X_train: np.ndarray,
-    y_train: np.ndarray,
-    feature_names: List[str],
-    threshold: float = "median",
-) -> Tuple[np.ndarray, np.ndarray, List[str]]:
-    """
-    Select important features using SelectFromModel with a RandomForest estimator.
-
-    Args:
-        X_train: Training feature matrix
-        y_train: Training labels
-        feature_names: Names of features
-        threshold: Feature selection threshold (default "median" for robustness)
-
-    Returns:
-        X_selected: Filtered feature matrix
-        selected_mask: Boolean mask of selected features
-        selected_names: Names of selected features
-    """
-    logger.info("[STEP] Feature Selection based on RandomForest importance")
-
-    # Train a RandomForest to estimate feature importance
-    rf_selector = RandomForestClassifier(
-        n_estimators=100,
-        max_depth=10,
-        min_samples_split=50,
-        random_state=42,
-        n_jobs=-1,
-    )
-    rf_selector.fit(X_train, y_train)
-
-    # Use SelectFromModel for feature selection
-    selector = SelectFromModel(
-        rf_selector,
-        prefit=True,
-        threshold=threshold,
-    )
-
-    selected_mask = selector.get_support()
-    X_selected = X_train[:, selected_mask]
-    selected_names = [feature_names[i] for i, sel in enumerate(selected_mask) if sel]
-
-    logger.info(
-        f"  Selected {len(selected_names)} / {len(feature_names)} features "
-        f"(reduction: {100 * (1 - len(selected_names) / len(feature_names)):.1f}%)"
-    )
-    logger.info(f"  Kept features: {selected_names[:10]}")
-    if len(selected_names) > 10:
-        logger.info(f"  ... and {len(selected_names) - 10} more")
-
-    return X_selected, selected_mask, selected_names
-
-
-def compute_feature_importance(
-    model,
-    feature_names: List[str],
-    importance_type: str = "weight",
-    top_k: int = 20,
-) -> pd.DataFrame:
-    """
-    Compute and rank feature importance from a trained model.
-
-    Args:
-        model: Trained model (RandomForest, XGBoost, LightGBM)
-        feature_names: Names of features
-        importance_type: Type of importance ("weight", "gain", "cover" for XGBoost)
-        top_k: Number of top features to return
-
-    Returns:
-        DataFrame with feature names and importance scores, sorted by importance
-    """
-    logger.info(f"[STEP] Computing feature importance ({importance_type})")
-
-    importances = None
-
-    if hasattr(model, 'feature_importances_'):
-        # RandomForest, LightGBM
-        importances = model.feature_importances_
-    elif hasattr(model, 'get_booster'):
-        # XGBoost
-        booster = model.get_booster()
-        importance_dict = booster.get_score(importance_type=importance_type)
-        importances = np.zeros(len(feature_names))
-        for feat_name, score in importance_dict.items():
-            if feat_name.startswith('f'):
-                try:
-                    idx = int(feat_name[1:])
-                    if idx < len(importances):
-                        importances[idx] = score
-                except (ValueError, IndexError):
-                    pass
-
-    if importances is None:
-        logger.warning("Could not compute feature importance; model type not supported")
-        return pd.DataFrame()
-
-    # Create importance DataFrame
-    importance_df = pd.DataFrame({
-        'feature': feature_names,
-        'importance': importances,
-    }).sort_values('importance', ascending=False)
-
-    logger.info(f"  Top {top_k} features:")
-    for idx, row in importance_df.head(top_k).iterrows():
-        logger.info(f"    {row['feature']}: {row['importance']:.6f}")
-
-    return importance_df
-
-
-def explain_model_with_shap(
-    model,
-    X_sample: np.ndarray,
-    X_background: np.ndarray = None,
-    model_name: str = "Model",
-    max_samples: int = 100,
-) -> Optional[Any]:
-    """
-    Generate SHAP explanations for model predictions.
-
-    Args:
-        model: Trained model
-        X_sample: Sample to explain (shape: [n_samples, n_features])
-        X_background: Background dataset for SHAP (default: random subset of X_sample)
-        model_name: Name of model for logging
-        max_samples: Maximum number of samples to explain
-
-    Returns:
-        SHAP Explainer object, or None if SHAP not available
-    """
-    if not SHAP_AVAILABLE:
-        logger.warning("SHAP not installed; skipping model explainability analysis")
-        return None
-
-    logger.info(f"[STEP] Computing SHAP explanations for {model_name}")
-
-    # Use random subset if sample is large
-    if len(X_sample) > max_samples:
-        indices = np.random.choice(len(X_sample), max_samples, replace=False)
-        X_explain = X_sample[indices]
-        logger.info(f"  Using {max_samples} samples for explanation (out of {len(X_sample)})")
-    else:
-        X_explain = X_sample
-
-    # Use background data for SHAP
-    if X_background is None:
-        n_background = min(100, len(X_sample) // 2)
-        bg_indices = np.random.choice(len(X_sample), n_background, replace=False)
-        X_background = X_sample[bg_indices]
-        logger.info(f"  Using {n_background} background samples for SHAP")
-
-    try:
-        # Create SHAP explainer
-        if hasattr(model, 'predict_proba'):
-            # Use TreeExplainer for tree-based models
-            explainer = shap.TreeExplainer(model)
-            shap_values = explainer.shap_values(X_explain)
-            logger.info(f"  SHAP TreeExplainer created; computed {len(shap_values)} samples")
-        else:
-            # Fallback to KernelExplainer
-            explainer = shap.KernelExplainer(
-                model.predict_proba if hasattr(model, 'predict_proba') else model.predict,
-                X_background,
-            )
-            shap_values = explainer.shap_values(X_explain)
-            logger.info(f"  SHAP KernelExplainer created; computed {len(shap_values)} samples")
-
-        return explainer, shap_values
-    except Exception as e:
-        logger.warning(f"SHAP explanation failed ({e}); skipping")
-        return None
-
-
-# ------------------------------------------------------------------------------
 # Threshold tuning and evaluation utilities
 # ------------------------------------------------------------------------------
 
@@ -1437,61 +1250,28 @@ def find_best_threshold(
     y_true: np.ndarray,
     y_proba: np.ndarray,
     beta: float = 1.0,
-    metric: str = "f_beta",
-) -> Tuple[float, float, Dict[str, float]]:
+) -> Tuple[float, float]:
     """
-    Find the probability threshold that optimizes a specified metric.
-
-    Supports optimization by F-beta, PR-AUC, or balanced accuracy.
-
-    Args:
-        y_true: True labels
-        y_proba: Predicted probabilities
-        beta: Beta parameter for F-beta score (default 1.0 for F1)
-        metric: Metric to optimize ("f_beta", "pr_auc", "balanced_accuracy")
-
-    Returns:
-        Tuple of (best_threshold, best_score, metrics_dict)
+    Find the probability threshold that maximizes F_beta using the PR curve.
+    Returns (best_threshold, best_f_beta).
     """
     precision, recall, thresholds = precision_recall_curve(y_true, y_proba)
+    # precision, recall length = len(thresholds) + 1
     thresholds = np.append(thresholds, 1.0)  # align lengths
 
     best_t = 0.5
     best_score = -1.0
-    best_metrics = {}
     eps = 1e-9
 
     for p, r, t in zip(precision, recall, thresholds):
         if p + r == 0:
             continue
-
-        if metric == "f_beta":
-            score = (1 + beta**2) * (p * r) / (beta**2 * p + r + eps)
-        elif metric == "pr_auc":
-            # Approximate PR-AUC by summing trapezoids
-            score = average_precision_score(y_true, y_proba)
-        elif metric == "balanced_accuracy":
-            pred = (y_proba >= t).astype(int)
-            tn = ((y_true == 0) & (pred == 0)).sum()
-            fn = ((y_true == 1) & (pred == 0)).sum()
-            tp = ((y_true == 1) & (pred == 1)).sum()
-            fp = ((y_true == 0) & (pred == 1)).sum()
-            sensitivity = tp / (tp + fn + eps) if (tp + fn) > 0 else 0
-            specificity = tn / (tn + fp + eps) if (tn + fp) > 0 else 0
-            score = (sensitivity + specificity) / 2
-        else:
-            score = (1 + beta**2) * (p * r) / (beta**2 * p + r + eps)
-
-        if score > best_score:
-            best_score = score
+        f_beta = (1 + beta**2) * (p * r) / (beta**2 * p + r + eps)
+        if f_beta > best_score:
+            best_score = f_beta
             best_t = t
-            best_metrics = {
-                'precision': float(p),
-                'recall': float(r),
-                'f_beta': float((1 + beta**2) * (p * r) / (beta**2 * p + r + eps)),
-            }
 
-    return float(best_t), float(best_score), best_metrics
+    return float(best_t), float(best_score)
 
 
 def precision_recall_at_k(
@@ -1519,41 +1299,23 @@ def evaluate_model(
     X_test,
     y_test,
     cfg: Config,
-    feature_names: List[str] = None,
 ) -> Dict[str, Any]:
     """
-    Comprehensive model evaluation with multiple metrics, threshold tuning, and explainability.
+    Evaluate model on val + test, including threshold tuning and precision@K.
 
-    Enhanced features:
-    - Multiple threshold optimization metrics (F-beta, PR-AUC, balanced accuracy)
-    - Feature importance ranking
-    - SHAP explainability (if available)
-    - Detailed confusion matrix analysis
-    - Precision@K metrics
-
-    Args:
-        name: Model name
-        model: Trained model
-        X_val: Validation features
-        y_val: Validation labels
-        X_test: Test features
-        y_test: Test labels
-        cfg: Configuration object
-        feature_names: List of feature names (for importance analysis)
-
-    Returns:
-        Dictionary of comprehensive metrics
+    Returns a dict of metrics.
     """
     logger.info("=" * 70)
     logger.info(f"Evaluating model: {name}")
 
-    # Extract probabilities
+    # Probabilities (fallback to decision_function if needed)
     if hasattr(model, "predict_proba"):
         val_proba = model.predict_proba(X_val)[:, 1]
         test_proba = model.predict_proba(X_test)[:, 1]
     elif hasattr(model, "decision_function"):
         val_scores = model.decision_function(X_val)
         test_scores = model.decision_function(X_test)
+        # map scores to 0-1 via min-max for approximate probabilities
         val_min, val_max = val_scores.min(), val_scores.max()
         test_min, test_max = test_scores.min(), test_scores.max()
         val_proba = (val_scores - val_min) / (val_max - val_min + 1e-9)
@@ -1561,7 +1323,7 @@ def evaluate_model(
     else:
         raise ValueError(f"Model {name} has neither predict_proba nor decision_function")
 
-    # Core metrics: AUC, PR-AUC
+    # AUC / PR-AUC
     val_auc = roc_auc_score(y_val, val_proba)
     val_ap = average_precision_score(y_val, val_proba)
     test_auc = roc_auc_score(y_test, test_proba)
@@ -1572,85 +1334,49 @@ def evaluate_model(
         f"Test AUC={test_auc:.4f}, PR-AUC={test_ap:.4f}"
     )
 
-    # Enhanced threshold tuning with multiple metrics
-    best_t, best_f_beta, threshold_metrics = find_best_threshold(
-        y_val, val_proba, beta=cfg.f_beta, metric="f_beta"
-    )
+    # Threshold tuning on validation
+    best_t, best_f_beta = find_best_threshold(y_val, val_proba, beta=cfg.f_beta)
     logger.info(
         f"[{name}] Best threshold (F_{cfg.f_beta:.1f} on val) = {best_t:.4f}, "
         f"F_{cfg.f_beta:.1f}={best_f_beta:.4f}"
     )
-    logger.info(f"  └─ Precision={threshold_metrics['precision']:.4f}, "
-                f"Recall={threshold_metrics['recall']:.4f}")
 
-    # Apply threshold and compute detailed metrics
+    # Apply threshold
     val_pred = (val_proba >= best_t).astype(int)
     test_pred = (test_proba >= best_t).astype(int)
 
-    # Standard metrics at best threshold
     val_f1 = f1_score(y_val, val_pred)
     test_f1 = f1_score(y_test, test_pred)
-    val_precision = precision_score(y_val, val_pred, zero_division=0)
-    test_precision = precision_score(y_test, test_pred, zero_division=0)
-    val_recall = recall_score(y_val, val_pred, zero_division=0)
-    test_recall = recall_score(y_test, test_pred, zero_division=0)
 
-    logger.info(
-        f"[{name}] Test Metrics: F1={test_f1:.4f}, Precision={test_precision:.4f}, Recall={test_recall:.4f}"
-    )
+    logger.info(f"[{name}] Validation F1={val_f1:.4f}, Test F1={test_f1:.4f}")
 
-    # Confusion matrix analysis
-    tn, fp, fn, tp = confusion_matrix(y_test, test_pred).ravel()
-    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
-    logger.info(
-        f"[{name}] Confusion Matrix: TP={tp}, FP={fp}, FN={fn}, TN={tn} | "
-        f"Specificity={specificity:.4f}"
-    )
-
-    # Verbose reports
     if cfg.verbose_reports:
+        logger.info(f"[{name}] Classification report (Validation):")
+        logger.info("\n" + classification_report(y_val, val_pred, digits=3))
+
         logger.info(f"[{name}] Classification report (Test):")
         logger.info("\n" + classification_report(y_test, test_pred, digits=3))
 
-    # Precision@K metrics
+    # Precision@K on test
     k, prec_k, rec_k = precision_recall_at_k(y_test, test_proba, frac=cfg.top_k_frac)
     logger.info(
         f"[{name}] Precision@top-{cfg.top_k_frac*100:.1f}% (K={k}): "
         f"precision={prec_k:.4f}, recall={rec_k:.4f}"
     )
 
-    # Feature importance
-    importance_df = None
-    if feature_names:
-        importance_df = compute_feature_importance(model, feature_names)
-
-    # SHAP explanability
-    shap_result = None
-    if feature_names:
-        shap_result = explain_model_with_shap(model, X_test[:100], model_name=name)
-
-    # Comprehensive metrics dict
     metrics = {
         "name": name,
         "val_auc": val_auc,
         "val_ap": val_ap,
         "val_f1": val_f1,
-        "val_precision": val_precision,
-        "val_recall": val_recall,
         "test_auc": test_auc,
         "test_ap": test_ap,
         "test_f1": test_f1,
-        "test_precision": test_precision,
-        "test_recall": test_recall,
-        "test_specificity": specificity,
         "best_threshold": best_t,
         "best_f_beta_val": best_f_beta,
         "precision_at_k": prec_k,
         "recall_at_k": rec_k,
         "k": k,
-        "confusion_matrix": {"TP": int(tp), "FP": int(fp), "FN": int(fn), "TN": int(tn)},
-        "importance_df": importance_df,
-        "shap_result": shap_result,
     }
 
     return metrics
@@ -1668,25 +1394,13 @@ def train_random_forest(
     cfg: Config,
 ):
     """
-    Train a regularized RandomForestClassifier with class weighting and cross-validation.
-
-    Features:
-    - Class weight balancing to handle imbalance
-    - Warm-start training for gradual tree growth
-    - Max depth and min samples controls to prevent overfitting
+    Train a reasonably regularized RandomForestClassifier.
     """
     logger.info("=" * 70)
-    logger.info("Training RandomForestClassifier (regularized + class weighting)")
-
+    logger.info("Training RandomForestClassifier (regularized)")
     total_trees = max(1, int(cfg.rf_n_estimators))
     chunk = max(1, min(int(cfg.rf_warm_start_chunk), total_trees))
     warm = total_trees > chunk
-
-    # Compute class weights manually for informational logging
-    n_fraud = (y_train == 1).sum()
-    n_non_fraud = (y_train == 0).sum()
-    fraud_weight = n_non_fraud / (n_fraud + 1e-8) if n_fraud > 0 else 1.0
-    logger.info(f"  Class weights: fraud={fraud_weight:.2f}, non-fraud=1.0 (auto-balanced)")
 
     rf = RandomForestClassifier(
         n_estimators=chunk if warm else total_trees,
@@ -1695,7 +1409,7 @@ def train_random_forest(
         min_samples_leaf=20,
         max_features="sqrt",
         n_jobs=cfg.rf_n_jobs,
-        class_weight="balanced_subsample",  # Automatically balance class weights at each split
+        class_weight="balanced_subsample",
         random_state=cfg.random_state,
         warm_start=warm,
     )
@@ -1709,22 +1423,15 @@ def train_random_forest(
         rf.fit(X_train, y_train)
         trees_built = target_trees
         duration = time.time() - start
-
-        # Compute validation AUC for monitoring
-        if hasattr(rf, 'predict_proba'):
-            val_proba = rf.predict_proba(X_val)[:, 1]
-            val_auc = roc_auc_score(y_val, val_proba)
-            logger.info(
-                f"  -> RandomForest progress: {trees_built}/{total_trees} trees "
-                f"(val AUC={val_auc:.4f}, {duration:.1f}s)"
-            )
-        else:
-            logger.info(
-                f"  -> RandomForest progress: {trees_built}/{total_trees} trees ({duration:.1f}s)"
-            )
+        logger.info(
+            "  -> RandomForest progress: %d/%d trees (%.1fs this chunk)",
+            trees_built,
+            total_trees,
+            duration,
+        )
 
     logger.info(
-        f"RandomForest training complete in {time.time() - overall_start:.1f}s"
+        "RandomForest training complete in %.1fs", time.time() - overall_start
     )
     return rf
 
@@ -1737,25 +1444,14 @@ def train_lightgbm(
     cfg: Config,
 ):
     """
-    Train a LightGBM model with early stopping, regularization, and class weighting.
-
-    Features:
-    - Balanced class weighting for imbalanced data
-    - Early stopping based on validation AUC
-    - L1/L2 regularization to prevent overfitting
+    Train a LightGBM model with early stopping and regularization (if LightGBM available).
     """
     if LGBMClassifier is None:
         logger.warning("LightGBM not installed; skipping LGBM model.")
         return None
 
     logger.info("=" * 70)
-    logger.info("Training LightGBMClassifier (regularized + class weighting + early stopping)")
-
-    # Log class weights
-    n_fraud = (y_train == 1).sum()
-    n_non_fraud = (y_train == 0).sum()
-    fraud_weight = n_non_fraud / (n_fraud + 1e-8) if n_fraud > 0 else 1.0
-    logger.info(f"  Class weights: fraud={fraud_weight:.2f}, non-fraud=1.0 (auto-balanced)")
+    logger.info("Training LightGBMClassifier (regularized + early stopping)")
 
     lgbm = LGBMClassifier(
         n_estimators=1000,
@@ -1768,27 +1464,24 @@ def train_lightgbm(
         reg_lambda=0.5,
         min_child_samples=50,
         objective="binary",
-        class_weight="balanced",  # Automatically balance class weights
+        class_weight="balanced",
         random_state=cfg.random_state,
         n_jobs=-1,
-        verbose=-1,  # Suppress verbose output
     )
 
     try:
         # Try newer LightGBM API with callbacks
         from lightgbm import early_stopping
-        logger.info("Using LightGBM early stopping with callbacks API")
         lgbm.fit(
             X_train,
             y_train,
             eval_set=[(X_val, y_val)],
             eval_metric="auc",
-            callbacks=[early_stopping(50, verbose=False)],
+            callbacks=[early_stopping(50)],
         )
-        logger.info(f"LightGBM best iteration: {lgbm.best_iteration_}")
     except (ImportError, TypeError) as e1:
         # Fallback to older API or direct fit without early stopping
-        logger.info(f"Newer LightGBM API not available ({type(e1).__name__}); using older API")
+        logger.info(f"Newer LightGBM API failed ({type(e1).__name__}); trying older API")
         try:
             lgbm.fit(
                 X_train,
@@ -1797,138 +1490,66 @@ def train_lightgbm(
                 eval_metric="auc",
                 early_stopping_rounds=50,
             )
-            logger.info(f"LightGBM best iteration: {lgbm.best_iteration_}")
         except TypeError as e2:
             # If early_stopping_rounds not supported, train without it
-            logger.warning(f"Early stopping not supported ({e2}); training without early stopping")
+            logger.warning(f"Early stopping not supported ({e2}); training without advanced options")
             try:
                 lgbm.fit(X_train, y_train)
-                logger.info(f"LightGBM training completed ({lgbm.n_estimators_} iterations)")
             except TypeError as e3:
                 logger.error(f"LightGBM fit failed ({e3}); skipping model")
                 return None
-
     return lgbm
 
 
-def tune_xgboost_params(X: np.ndarray, y: np.ndarray, sample_size: int = 5000, cv_splits: int = 3) -> Dict[str, Any]:
-    """
-    Perform grid search with cross-validation to find best hyperparameters for XGBoost.
-    Uses a random sample of the training data (up to sample_size) for efficiency.
-
-    Args:
-        X: Training feature matrix
-        y: Training labels
-        sample_size: Maximum number of samples to use for tuning (default 5000)
-        cv_splits: Number of cross-validation splits (default 3)
-
-    Returns:
-        Dictionary of best hyperparameters found during grid search
-    """
-    X_sample, y_sample = X, y
-    if len(y) > sample_size:
-        rng = np.random.RandomState(42)
-        indices = rng.choice(len(y), size=sample_size, replace=False)
-        X_sample = X[indices]
-        y_sample = y[indices]
-
-    param_grid = {
-        "max_depth": [3, 4, 5, 6],
-        "gamma": [0.5, 1, 2],
-        "min_child_weight": [100],
-        "subsample": [0.6, 0.8, 1.0],
-        "colsample_bytree": [0.6, 0.8, 1.0],
-        "learning_rate": [0.1, 0.01],
-    }
-    xgb_est = XGBClassifier(
-        objective="binary:logistic",
-        eval_metric="auc",
-        use_label_encoder=False,
-        n_estimators=100,
-        n_jobs=-1,
-        random_state=42,
-    )
-    cv = StratifiedKFold(n_splits=cv_splits, shuffle=True, random_state=42)
-    grid_search = GridSearchCV(
-        estimator=xgb_est,
-        param_grid=param_grid,
-        scoring="roc_auc",
-        cv=cv,
-        n_jobs=-1,
-        verbose=1
-    )
-    logger.info("Starting XGBoost hyperparameter tuning with GridSearchCV...")
-    grid_search.fit(X_sample, y_sample)
-    logger.info(f"Best XGBoost params: {grid_search.best_params_} | Best CV AUC: {grid_search.best_score_:.4f}")
-    return grid_search.best_params_
-
-
 def train_xgboost(
-    X_train: np.ndarray,
-    y_train: np.ndarray,
-    X_val: np.ndarray,
-    y_val: np.ndarray,
+    X_train,
+    y_train,
+    X_val,
+    y_val,
     cfg: Config,
 ):
     """
-    Train an XGBoost binary classifier with IBM-style hyperparameter tuning,
-    early stopping, class weighting, and regularization.
-
-    Enhanced features:
-    - GridSearchCV hyperparameter tuning on training data
-    - Scale_pos_weight for class imbalance handling
-    - Early stopping based on validation AUC
-    - Adaptive learning rates and tree depth based on data characteristics
-    - Comprehensive logging and monitoring
+    Train an XGBoost binary classifier with early stopping and regularization.
     """
     if XGBClassifier is None:
         logger.warning("XGBoost not installed; skipping XGBoost model.")
         return None
 
     logger.info("=" * 70)
-    logger.info("Training XGBoostClassifier with IBM-style hyperparameter tuning")
+    logger.info("Training XGBoostClassifier (regularized + early stopping)")
 
-    # Compute class weights for XGBoost
-    n_fraud = (y_train == 1).sum()
-    n_non_fraud = (y_train == 0).sum()
-    scale_pos_weight = n_non_fraud / (n_fraud + 1e-8) if n_fraud > 0 else 1.0
-    logger.info(f"  Class imbalance ratio (scale_pos_weight): {scale_pos_weight:.2f}")
+    xgb = XGBClassifier(
+        n_estimators=1000,
+        learning_rate=0.05,
+        max_depth=6,
+        min_child_weight=5,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_alpha=0.1,
+        reg_lambda=1.0,
+        objective="binary:logistic",
+        tree_method="hist",
+        n_jobs=-1,
+        eval_metric="auc",
+        random_state=cfg.random_state,
+    )
 
-    # Step 1: Hyperparameter tuning via GridSearchCV
-    logger.info("Step 1: Hyperparameter tuning via GridSearchCV")
-    best_params = tune_xgboost_params(X_train, y_train)
-
-    # Step 2: Build final model with best parameters and class weighting
-    logger.info("Step 2: Building final model with best parameters")
-    xgb_params = {
-        "objective": "binary:logistic",
-        "eval_metric": "auc",
-        "use_label_encoder": False,
-        "n_jobs": -1,
-        "scale_pos_weight": scale_pos_weight,  # Handle class imbalance
-        "random_state": cfg.random_state,
-        **best_params,
-    }
-
-    xgb = XGBClassifier(n_estimators=1000, **xgb_params)
-
-    # Step 3: Train with early stopping
-    logger.info("Step 3: Training XGBoost with early stopping on validation set")
     try:
+        # Try with early stopping (newer XGBoost versions)
         xgb.fit(
             X_train,
             y_train,
             eval_set=[(X_val, y_val)],
             early_stopping_rounds=50,
-            verbose=False
         )
-        logger.info(
-            f"XGBoost training complete: best iteration={xgb.best_iteration} "
-            f"with val AUC={xgb.best_score:.4f}"
-        )
-    except Exception as e:
-        logger.error(f"XGBoost training failed: {e}", exc_info=True)
-        return None
+    except TypeError as e1:
+        # Fallback to basic fit without early stopping
+        logger.warning(f"XGBoost early stopping not supported ({e1}); training without")
+        try:
+            xgb.fit(X_train, y_train)
+        except Exception as e2:
+            logger.error(f"XGBoost fit failed ({e2}); skipping model")
+            return None
 
     return xgb
 
@@ -1992,30 +1613,9 @@ def run_pipeline(cfg: Config) -> Dict[str, Dict[str, Any]]:
     # - Standard ML best practice: resample only training, validate/test on original data
     X_train_res, y_train_res = resample_training_data(X_train, y_train, cfg)
 
-    # Extract feature names for importance analysis and explainability
-    preprocessor = preprocess_pipeline.named_steps["preprocessor"]
-    feature_names = []
-    if hasattr(preprocessor, "transformers_"):
-        for name, transformer, columns in preprocessor.transformers_:
-            if name == "num":
-                feature_names.extend(columns)
-            elif name == "cat":
-                # Get OHE feature names
-                if hasattr(transformer.named_steps.get("ohe"), "get_feature_names_out"):
-                    try:
-                        ohe_names = transformer.named_steps["ohe"].get_feature_names_out(columns)
-                        feature_names.extend(ohe_names)
-                    except Exception:
-                        feature_names.extend(columns)
-                else:
-                    feature_names.extend(columns)
-
-    logger.info(f"[STEP] Final feature matrix has {len(feature_names)} features")
-
     results: Dict[str, Dict[str, Any]] = {}
 
     # 9. Train & evaluate RandomForest
-    logger.info("\n[TRAIN] RandomForest Model")
     rf = train_random_forest(X_train_res, y_train_res, X_val, y_val, cfg)
     rf_metrics = evaluate_model(
         "RandomForest",
@@ -2025,12 +1625,10 @@ def run_pipeline(cfg: Config) -> Dict[str, Dict[str, Any]]:
         X_test,
         y_test,
         cfg,
-        feature_names=feature_names,
     )
     results["RandomForest"] = rf_metrics
 
     # 10. Train & evaluate LightGBM
-    logger.info("\n[TRAIN] LightGBM Model")
     lgbm = train_lightgbm(X_train_res, y_train_res, X_val, y_val, cfg)
     if lgbm is not None:
         lgbm_metrics = evaluate_model(
@@ -2041,12 +1639,10 @@ def run_pipeline(cfg: Config) -> Dict[str, Dict[str, Any]]:
             X_test,
             y_test,
             cfg,
-            feature_names=feature_names,
         )
         results["LightGBM"] = lgbm_metrics
 
     # 11. Train & evaluate XGBoost
-    logger.info("\n[TRAIN] XGBoost Model")
     xgb = train_xgboost(X_train_res, y_train_res, X_val, y_val, cfg)
     if xgb is not None:
         xgb_metrics = evaluate_model(
@@ -2057,28 +1653,13 @@ def run_pipeline(cfg: Config) -> Dict[str, Dict[str, Any]]:
             X_test,
             y_test,
             cfg,
-            feature_names=feature_names,
         )
         results["XGBoost"] = xgb_metrics
 
-    # 12. Summary and best model selection
     logger.info("=" * 70)
     logger.info("PIPELINE EXECUTION COMPLETE!")
     logger.info("=" * 70)
     logger.info(f"Models trained: {list(results.keys())}")
-
-    # Find best model by test AUC
-    if results:
-        best_model_name = max(results.keys(), key=lambda x: results[x].get("test_auc", 0))
-        best_metrics = results[best_model_name]
-        logger.info("\n[BEST MODEL] Summary:")
-        logger.info(f"  Model: {best_model_name}")
-        logger.info(f"  Test AUC: {best_metrics.get('test_auc', 0):.4f}")
-        logger.info(f"  Test PR-AUC: {best_metrics.get('test_ap', 0):.4f}")
-        logger.info(f"  Test F1: {best_metrics.get('test_f1', 0):.4f}")
-        logger.info(f"  Test Precision: {best_metrics.get('test_precision', 0):.4f}")
-        logger.info(f"  Test Recall: {best_metrics.get('test_recall', 0):.4f}")
-        logger.info(f"  Optimal Threshold: {best_metrics.get('best_threshold', 0):.4f}")
 
     return results
 
