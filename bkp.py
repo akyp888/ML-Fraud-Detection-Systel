@@ -1172,12 +1172,29 @@ def resample_training_data(
                 kind="borderline-1",
             )
             X_smote, y_smote = sampler.fit_resample(X_train, y_train)
+            fraud_after_smote = int(y_smote.sum())
+
             if TomekLinks is not None:
                 tomek = TomekLinks()
                 X_clean, y_clean = tomek.fit_resample(X_smote, y_smote)
-                return _log_and_return(X_clean, y_clean, "BorderlineSMOTE + TomekLinks")
-            logger.info("TomekLinks unavailable; returning BorderlineSMOTE-only resampled data")
-            return _log_and_return(X_smote, y_smote, "BorderlineSMOTE")
+                fraud_after_tomek = int(y_clean.sum())
+
+                # Verify TomekLinks didn't remove all synthetic samples
+                if fraud_after_tomek > n_minority:
+                    logger.info(f"✓ BorderlineSMOTE created {fraud_after_smote} fraud, TomekLinks refined to {fraud_after_tomek}")
+                    return _log_and_return(X_clean, y_clean, "BorderlineSMOTE + TomekLinks")
+                else:
+                    logger.warning(f"TomekLinks removed too many samples ({fraud_after_tomek} fraud); skipping")
+                    return None
+
+            # Check if SMOTE alone created synthetic samples
+            if fraud_after_smote > n_minority:
+                logger.info(f"✓ BorderlineSMOTE created synthetic fraud: {n_minority} → {fraud_after_smote}")
+                return _log_and_return(X_smote, y_smote, "BorderlineSMOTE")
+            else:
+                logger.warning(f"BorderlineSMOTE output unchanged ({fraud_after_smote} fraud); need fallback")
+                return None
+
         except Exception as e:
             logger.warning(f"BorderlineSMOTE failed ({e}); falling back to pure SMOTE")
             return None
@@ -1517,13 +1534,23 @@ def train_xgboost(
         random_state=cfg.random_state,
     )
 
-    xgb.fit(
-        X_train,
-        y_train,
-        eval_set=[(X_val, y_val)],
-        early_stopping_rounds=50,
-        verbose=False,
-    )
+    try:
+        # Try with early stopping (newer XGBoost versions)
+        xgb.fit(
+            X_train,
+            y_train,
+            eval_set=[(X_val, y_val)],
+            early_stopping_rounds=50,
+        )
+    except TypeError as e1:
+        # Fallback to basic fit without early stopping
+        logger.warning(f"XGBoost early stopping not supported ({e1}); training without")
+        try:
+            xgb.fit(X_train, y_train)
+        except Exception as e2:
+            logger.error(f"XGBoost fit failed ({e2}); skipping model")
+            return None
+
     return xgb
 
 
