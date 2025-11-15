@@ -1195,23 +1195,33 @@ def resample_training_data(
             logger.warning("SMOTE not available; using original training data")
             return X_train, y_train
 
-    # Try pure SMOTE first
+    # Fallback: Try pure SMOTE with k_neighbors=1 (minimum for synthetic generation)
     try:
-        logger.info(f"Applying pure SMOTE with k_neighbors={k_neighbors}...")
-        smote_estimator = SMOTE(k_neighbors=k_neighbors, random_state=cfg.random_state)
+        smote_k = max(1, min(k_neighbors, 1))  # Use k_neighbors=1 for maximum compatibility
+        logger.info(f"Applying pure SMOTE with k_neighbors={smote_k}...")
+        smote_estimator = SMOTE(k_neighbors=smote_k, random_state=cfg.random_state)
         X_res, y_res = smote_estimator.fit_resample(X_train, y_train)
-        return _log_and_return(X_res, y_res, "SMOTE")
+        fraud_after = int(y_res.sum())
+        if fraud_after > n_minority:
+            logger.info(f"✓ SMOTE successfully created synthetic fraud: {n_minority} → {fraud_after}")
+            return _log_and_return(X_res, y_res, "SMOTE")
+        else:
+            logger.warning(f"SMOTE output unchanged ({fraud_after} fraud); trying RandomOverSampler")
     except Exception as e:
         logger.warning(f"Pure SMOTE failed ({e}); trying RandomOverSampler as fallback")
 
-    # Last resort: Simple random oversampling
+    # Last resort: Simple random oversampling (duplicates minority samples)
     try:
         from imblearn.over_sampling import RandomOverSampler
+        logger.info("Applying RandomOverSampler (random duplication of fraud cases)...")
         sampler = RandomOverSampler(random_state=cfg.random_state)
         X_res, y_res = sampler.fit_resample(X_train, y_train)
+        fraud_after = int(y_res.sum())
+        logger.info(f"✓ RandomOverSampler created duplicate fraud cases: {n_minority} → {fraud_after}")
         return _log_and_return(X_res, y_res, "RandomOverSampler")
     except Exception as e:
         logger.warning(f"RandomOverSampler failed ({e}); returning original training data")
+        logger.warning("WARNING: Model will train on original highly imbalanced data with only 4 fraud cases!")
         return X_train, y_train
 
 
@@ -1451,10 +1461,10 @@ def train_lightgbm(
             eval_set=[(X_val, y_val)],
             eval_metric="auc",
             callbacks=[early_stopping(50)],
-            verbose=False,
         )
-    except (ImportError, TypeError):
+    except (ImportError, TypeError) as e1:
         # Fallback to older API or direct fit without early stopping
+        logger.info(f"Newer LightGBM API failed ({type(e1).__name__}); trying older API")
         try:
             lgbm.fit(
                 X_train,
@@ -1462,16 +1472,15 @@ def train_lightgbm(
                 eval_set=[(X_val, y_val)],
                 eval_metric="auc",
                 early_stopping_rounds=50,
-                verbose=False,
             )
-        except TypeError:
+        except TypeError as e2:
             # If early_stopping_rounds not supported, train without it
-            logger.warning("Early stopping not supported in this LightGBM version; training without")
-            lgbm.fit(
-                X_train,
-                y_train,
-                verbose=False,
-            )
+            logger.warning(f"Early stopping not supported ({e2}); training without advanced options")
+            try:
+                lgbm.fit(X_train, y_train)
+            except TypeError as e3:
+                logger.error(f"LightGBM fit failed ({e3}); skipping model")
+                return None
     return lgbm
 
 
