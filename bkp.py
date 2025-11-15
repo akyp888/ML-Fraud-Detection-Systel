@@ -699,6 +699,16 @@ def resample_train_val_combined(
 
     logger.info(f"    Imputed {len(numeric_cols)} numeric columns, {len(categorical_cols)} categorical columns")
 
+    # Convert categorical columns to numeric via ordinal encoding (required for SMOTE)
+    if categorical_cols:
+        logger.info(f"  Converting {len(categorical_cols)} categorical columns to numeric for SMOTE...")
+        from sklearn.preprocessing import LabelEncoder
+        label_encoders = {}
+        for col in categorical_cols:
+            le = LabelEncoder()
+            X_combined_imputed[col] = le.fit_transform(X_combined_imputed[col].astype(str))
+            label_encoders[col] = le
+
     # Apply SMOTE if available
     if SMOTETomek is None:
         logger.warning("SMOTE not available; returning original train/val without resampling")
