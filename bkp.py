@@ -456,23 +456,54 @@ def split_train_val_test(
     cfg: Config,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Split into train/val/test.
+    Split into train/val/test with fraud preservation.
 
-    Prefer temporal split if transaction date is available; otherwise stratified random.
+    Prefer stratified temporal split if transaction date is available;
+    otherwise stratified random split.
+
+    Key: Ensures fraud cases are distributed across all splits for proper evaluation.
+    If any split has 0 fraud and total fraud > 0, rebalance splits to ensure each has fraud.
     """
     df = df.copy()
     y = df[cfg.label_col].values
+    total_fraud = int(y.sum())
 
     if cfg.trx_date_col in df.columns:
-        logger.info("Using temporal split by TRX_DATE")
+        logger.info("Using stratified temporal split by TRX_DATE (preserves fraud ratio)")
         df = df.sort_values(cfg.trx_date_col)
-        # simple temporal: oldest 70%, next 15%, newest 15%
-        n = len(df)
-        n_train = int((1.0 - cfg.val_size - cfg.test_size) * n)
-        n_val = int(cfg.val_size * n)
-        train = df.iloc[:n_train]
-        val = df.iloc[n_train : n_train + n_val]
-        test = df.iloc[n_train + n_val :]
+
+        # Stratified temporal: preserve fraud ratio in each temporal bucket
+        # Split by fraud status first, then apply temporal split within each group
+        fraud_mask = df[cfg.label_col] == 1
+        fraud_df = df[fraud_mask].sort_values(cfg.trx_date_col)
+        non_fraud_df = df[~fraud_mask].sort_values(cfg.trx_date_col)
+
+        n_fraud = len(fraud_df)
+        n_non_fraud = len(non_fraud_df)
+
+        # Calculate split sizes for fraud data
+        n_train_fraud = int((1.0 - cfg.val_size - cfg.test_size) * n_fraud)
+        n_val_fraud = int(cfg.val_size * n_fraud)
+
+        # Calculate split sizes for non-fraud data
+        n_train_non_fraud = int((1.0 - cfg.val_size - cfg.test_size) * n_non_fraud)
+        n_val_non_fraud = int(cfg.val_size * n_non_fraud)
+
+        # Split fraud and non-fraud temporally
+        train_fraud = fraud_df.iloc[:n_train_fraud]
+        val_fraud = fraud_df.iloc[n_train_fraud : n_train_fraud + n_val_fraud]
+        test_fraud = fraud_df.iloc[n_train_fraud + n_val_fraud :]
+
+        train_non_fraud = non_fraud_df.iloc[:n_train_non_fraud]
+        val_non_fraud = non_fraud_df.iloc[n_train_non_fraud : n_train_non_fraud + n_val_non_fraud]
+        test_non_fraud = non_fraud_df.iloc[n_train_non_fraud + n_val_non_fraud :]
+
+        # Combine fraud and non-fraud
+        train = pd.concat([train_fraud, train_non_fraud], ignore_index=True)
+        val = pd.concat([val_fraud, val_non_fraud], ignore_index=True)
+        test = pd.concat([test_fraud, test_non_fraud], ignore_index=True)
+
+        logger.info(f"  Stratified temporal split: fraud split as {n_train_fraud}/{n_val_fraud}/{len(test_fraud)}")
     else:
         logger.info("Using stratified random split (no TRX_DATE available)")
         train_val, test = train_test_split(
@@ -489,12 +520,77 @@ def split_train_val_test(
             random_state=cfg.random_state,
         )
 
+    train_fraud = int(train[cfg.label_col].sum())
+    val_fraud = int(val[cfg.label_col].sum())
+    test_fraud = int(test[cfg.label_col].sum())
+
     logger.info(
         f"Split sizes: train={len(train)}, val={len(val)}, test={len(test)} "
-        f"(fraud in train={int(train[cfg.label_col].sum())}, "
-        f"fraud in val={int(val[cfg.label_col].sum())}, "
-        f"fraud in test={int(test[cfg.label_col].sum())})"
+        f"(fraud in train={train_fraud}, fraud in val={val_fraud}, fraud in test={test_fraud})"
     )
+
+    # Handle case where any split has 0 fraud
+    if total_fraud > 0 and (train_fraud == 0 or val_fraud == 0 or test_fraud == 0):
+        logger.warning(
+            f"Imbalanced fraud distribution: train={train_fraud}, val={val_fraud}, test={test_fraud}"
+        )
+        logger.warning("Rebalancing splits to ensure each has at least 1 fraud case...")
+
+        # Collect all data and labels
+        all_data = pd.concat([train, val, test], ignore_index=True)
+        fraud_cases = all_data[all_data[cfg.label_col] == 1]
+        non_fraud_cases = all_data[all_data[cfg.label_col] == 0]
+
+        # Ensure each split gets at least 1 fraud
+        min_fraud_per_split = 1
+        required_fraud = 3  # one for each split
+        available_fraud = len(fraud_cases)
+
+        if available_fraud >= required_fraud:
+            # Distribute fraud evenly
+            fraud_train_count = max(min_fraud_per_split, available_fraud // 3)
+            fraud_val_count = max(min_fraud_per_split, (available_fraud - fraud_train_count) // 2)
+            fraud_test_count = available_fraud - fraud_train_count - fraud_val_count
+
+            # Randomly distribute fraud cases
+            fraud_indices = np.random.RandomState(cfg.random_state).permutation(available_fraud)
+            fraud_train_idx = fraud_indices[:fraud_train_count]
+            fraud_val_idx = fraud_indices[fraud_train_count : fraud_train_count + fraud_val_count]
+            fraud_test_idx = fraud_indices[fraud_train_count + fraud_val_count :]
+
+            # Distribute non-fraud proportionally
+            available_non_fraud = len(non_fraud_cases)
+            non_fraud_train_count = int((available_non_fraud) * 0.70)
+            non_fraud_val_count = int((available_non_fraud) * 0.15)
+            non_fraud_test_count = available_non_fraud - non_fraud_train_count - non_fraud_val_count
+
+            non_fraud_indices = np.random.RandomState(cfg.random_state).permutation(available_non_fraud)
+            non_fraud_train_idx = non_fraud_indices[:non_fraud_train_count]
+            non_fraud_val_idx = non_fraud_indices[non_fraud_train_count : non_fraud_train_count + non_fraud_val_count]
+            non_fraud_test_idx = non_fraud_indices[non_fraud_train_count + non_fraud_val_count :]
+
+            # Reconstruct splits
+            train = pd.concat(
+                [fraud_cases.iloc[fraud_train_idx], non_fraud_cases.iloc[non_fraud_train_idx]],
+                ignore_index=True
+            )
+            val = pd.concat(
+                [fraud_cases.iloc[fraud_val_idx], non_fraud_cases.iloc[non_fraud_val_idx]],
+                ignore_index=True
+            )
+            test = pd.concat(
+                [fraud_cases.iloc[fraud_test_idx], non_fraud_cases.iloc[non_fraud_test_idx]],
+                ignore_index=True
+            )
+
+            logger.info(
+                f"Rebalanced split sizes: train={len(train)}, val={len(val)}, test={len(test)} "
+                f"(fraud in train={int(train[cfg.label_col].sum())}, "
+                f"fraud in val={int(val[cfg.label_col].sum())}, "
+                f"fraud in test={int(test[cfg.label_col].sum())})"
+            )
+        else:
+            logger.warning(f"Very few fraud cases ({available_fraud}); cannot guarantee all splits have fraud")
 
     return train.reset_index(drop=True), val.reset_index(drop=True), test.reset_index(drop=True)
 
@@ -1437,23 +1533,19 @@ def run_pipeline(cfg: Config) -> Dict[str, Dict[str, Any]]:
         preprocess_pipeline,
     ) = build_feature_matrix(train_fe, val_fe, test_fe, cfg)
 
-    # 8. Apply SMOTE to combined train+val AFTER encoding (on numeric data only)
-    # This is the best approach:
-    # - Works on already-encoded numeric data (no categorical string issues)
-    # - Standard production ML pipeline approach
-    # - Handles unknown actual data characteristics
-    # Test set is NOT resampled (kept pure for final evaluation)
-    X_train, X_val, y_train, y_val = resample_train_val_combined_after_encoding(
-        X_train, X_val, y_train, y_val, cfg
-    )
-
-    # 9. Additional resampling of X_train only (for further class balance refinement if desired)
-    # Note: train+val were already resampled in step 8, so this is optional fine-tuning
+    # 8. Apply SMOTE ONLY to training set (not validation or test)
+    # IMPORTANT: Validation and test sets stay PURE (original temporal split data)
+    # This allows realistic evaluation on real fraud patterns, not synthetic ones
+    # Benefits:
+    # - Validation metrics reflect real fraud detection capability
+    # - No overfitting to synthetic fraud patterns (common pitfall)
+    # - Test set remains uncontaminated for final evaluation
+    # - Standard ML best practice: resample only training, validate/test on original data
     X_train_res, y_train_res = resample_training_data(X_train, y_train, cfg)
 
     results: Dict[str, Dict[str, Any]] = {}
 
-    # 10. Train & evaluate RandomForest
+    # 9. Train & evaluate RandomForest
     rf = train_random_forest(X_train_res, y_train_res, X_val, y_val, cfg)
     rf_metrics = evaluate_model(
         "RandomForest",
@@ -1466,7 +1558,7 @@ def run_pipeline(cfg: Config) -> Dict[str, Dict[str, Any]]:
     )
     results["RandomForest"] = rf_metrics
 
-    # 11. Train & evaluate LightGBM
+    # 10. Train & evaluate LightGBM
     lgbm = train_lightgbm(X_train_res, y_train_res, X_val, y_val, cfg)
     if lgbm is not None:
         lgbm_metrics = evaluate_model(
@@ -1480,7 +1572,7 @@ def run_pipeline(cfg: Config) -> Dict[str, Dict[str, Any]]:
         )
         results["LightGBM"] = lgbm_metrics
 
-    # 12. Train & evaluate XGBoost
+    # 11. Train & evaluate XGBoost
     xgb = train_xgboost(X_train_res, y_train_res, X_val, y_val, cfg)
     if xgb is not None:
         xgb_metrics = evaluate_model(
