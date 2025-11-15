@@ -642,6 +642,122 @@ def engineer_features(
 
 
 # ------------------------------------------------------------------------------
+# Intelligent Cardinality-based Encoding
+# ------------------------------------------------------------------------------
+
+def analyze_column_cardinality(
+    df: pd.DataFrame,
+    categorical_cols: List[str],
+    low_card_threshold: int = 50,
+    high_card_threshold: int = 500,
+) -> Tuple[List[str], List[str], List[str]]:
+    """
+    Analyze actual cardinality of categorical columns and categorize them.
+
+    Returns three lists:
+    - low_card_ohe: columns with cardinality < low_card_threshold (use OHE)
+    - med_card_target: columns with cardinality between thresholds (use target encoding)
+    - high_card_target: columns with cardinality > high_card_threshold (use target encoding)
+    """
+    low_card_ohe = []
+    med_card_target = []
+    high_card_target = []
+
+    cardinality_report = {}
+
+    for col in categorical_cols:
+        if col not in df.columns:
+            continue
+
+        nunique = df[col].nunique()
+        cardinality_report[col] = nunique
+
+        if nunique < low_card_threshold:
+            low_card_ohe.append(col)
+        elif nunique < high_card_threshold:
+            med_card_target.append(col)
+        else:
+            high_card_target.append(col)
+
+    logger.info("[CARDINALITY ANALYSIS]")
+    logger.info(f"  Low cardinality (OHE, <{low_card_threshold}): {len(low_card_ohe)} columns")
+    if low_card_ohe:
+        for col in low_card_ohe[:5]:
+            logger.info(f"    - {col}: {cardinality_report[col]} unique values")
+        if len(low_card_ohe) > 5:
+            logger.info(f"    ... and {len(low_card_ohe) - 5} more")
+
+    logger.info(f"  Medium cardinality (Target Encode, {low_card_threshold}-{high_card_threshold}): {len(med_card_target)} columns")
+    if med_card_target:
+        for col in med_card_target[:5]:
+            logger.info(f"    - {col}: {cardinality_report[col]} unique values")
+        if len(med_card_target) > 5:
+            logger.info(f"    ... and {len(med_card_target) - 5} more")
+
+    logger.info(f"  High cardinality (Target Encode, >{high_card_threshold}): {len(high_card_target)} columns")
+    if high_card_target:
+        for col in high_card_target[:5]:
+            logger.info(f"    - {col}: {cardinality_report[col]} unique values")
+        if len(high_card_target) > 5:
+            logger.info(f"    ... and {len(high_card_target) - 5} more")
+
+    return low_card_ohe, med_card_target, high_card_target
+
+
+def compute_target_encoding_stats(
+    train: pd.DataFrame,
+    cfg: Config,
+    target_cols: List[str],
+) -> Dict[str, pd.DataFrame]:
+    """
+    Compute target encoding (fraud rate) for high-cardinality columns from training data only.
+
+    Returns dict: column_name -> stats_df with [column_value, FRAUD_RATE]
+    """
+    stats_dict: Dict[str, pd.DataFrame] = {}
+
+    for col in target_cols:
+        if col not in train.columns:
+            continue
+
+        # Group by column and compute fraud rate
+        grouped = train.groupby(col)[cfg.label_col].agg(["sum", "count"]).reset_index()
+        grouped.columns = [col, "fraud_count", "total_count"]
+        grouped["FRAUD_RATE"] = grouped["fraud_count"] / grouped["total_count"].clip(lower=1)
+
+        # Keep only column and fraud rate
+        grouped = grouped[[col, "FRAUD_RATE"]].copy()
+        grouped.rename(columns={"FRAUD_RATE": f"{col}_TARGET_ENCODED"}, inplace=True)
+
+        stats_dict[col] = grouped
+
+    return stats_dict
+
+
+def apply_target_encoding(
+    df: pd.DataFrame,
+    stats_dict: Dict[str, pd.DataFrame],
+    default_rate: float = 0.0,
+) -> pd.DataFrame:
+    """Apply precomputed target encoding (fraud rates) to dataframe."""
+    df = df.copy()
+
+    for col, stats in stats_dict.items():
+        if col not in df.columns:
+            continue
+
+        # Merge stats and fill unknown values with default rate
+        encoded_col = f"{col}_TARGET_ENCODED"
+        df = df.merge(stats, on=col, how="left")
+        df[encoded_col] = df[encoded_col].fillna(default_rate).astype("float32")
+
+        # Drop original column since it's now encoded
+        df = df.drop(columns=[col], errors="ignore")
+
+    return df
+
+
+# ------------------------------------------------------------------------------
 # Preprocessing & feature matrix construction
 # ------------------------------------------------------------------------------
 
@@ -680,21 +796,48 @@ def build_feature_matrix(
         else:
             categorical_cols.append(col)
 
-    # Remove obviously high-cardinality ID-like columns from categorical OHE,
-    # relying instead on numeric stats we created for them.
-    high_card_id_cols = [
-        cfg.customer_col,
-        cfg.account_col,
-        cfg.dest_account_col,
-        cfg.device_col,
-        cfg.ip_col,
-        cfg.phone_col,
-        cfg.email_col,
-    ]
-    categorical_cols = [c for c in categorical_cols if c not in high_card_id_cols]
+    # Analyze cardinality of all categorical columns
+    low_card_ohe, med_card_target, high_card_target = analyze_column_cardinality(
+        train_fe, categorical_cols, low_card_threshold=50, high_card_threshold=500
+    )
+
+    # Combine medium + high cardinality columns for target encoding
+    target_encode_cols = med_card_target + high_card_target
 
     logger.info(f"  Numeric feature columns: {len(numeric_cols)}")
-    logger.info(f"  Categorical feature columns (OHE): {len(categorical_cols)}")
+    logger.info(f"  Low cardinality categorical (OHE): {len(low_card_ohe)}")
+    logger.info(f"  High cardinality categorical (Target Encoding): {len(target_encode_cols)}")
+
+    # Compute target encoding statistics from training data
+    if target_encode_cols:
+        logger.info("Computing target encoding (fraud rates) for high-cardinality columns...")
+        target_stats = compute_target_encoding_stats(train_fe, cfg, target_encode_cols)
+
+        # Apply target encoding to all datasets
+        train_fe = apply_target_encoding(train_fe, target_stats, default_rate=0.0)
+        val_fe = apply_target_encoding(val_fe, target_stats, default_rate=0.0)
+        test_fe = apply_target_encoding(test_fe, target_stats, default_rate=0.0)
+
+        logger.info(f"Applied target encoding to {len(target_encode_cols)} columns")
+
+    # Rebuild feature columns list after target encoding
+    # (target-encoded columns are added, original high-cardinality columns are dropped)
+    feature_cols = [
+        c for c in train_fe.columns
+        if c not in exclude_cols and c not in target_encode_cols
+    ]
+
+    # Re-identify numeric vs categorical after target encoding
+    numeric_cols: List[str] = []
+    categorical_cols_final: List[str] = []
+    for col in feature_cols:
+        if pd.api.types.is_numeric_dtype(train_fe[col]):
+            numeric_cols.append(col)
+        else:
+            categorical_cols_final.append(col)
+
+    # Keep only low-cardinality categorical columns (high-cardinality are already target-encoded)
+    categorical_cols_final = [c for c in categorical_cols_final if c in low_card_ohe]
 
     numeric_transformer = Pipeline(
         steps=[
@@ -725,7 +868,7 @@ def build_feature_matrix(
     preprocessor = ColumnTransformer(
         transformers=[
             ("num", numeric_transformer, numeric_cols),
-            ("cat", categorical_transformer, categorical_cols),
+            ("cat", categorical_transformer, categorical_cols_final),
         ]
     )
 
