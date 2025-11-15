@@ -681,9 +681,23 @@ def resample_train_val_combined(
 
     # Impute missing values before SMOTE (SMOTE cannot handle NaN)
     logger.info("  Imputing missing values before SMOTE...")
-    imputer = SimpleImputer(strategy="median")
-    X_combined_imputed = imputer.fit_transform(X_combined)
-    X_combined_imputed = pd.DataFrame(X_combined_imputed, columns=X_combined.columns)
+    X_combined_imputed = X_combined.copy()
+
+    # Separate numeric and categorical columns
+    numeric_cols = X_combined_imputed.select_dtypes(include=[np.number]).columns.tolist()
+    categorical_cols = X_combined_imputed.select_dtypes(include=['object']).columns.tolist()
+
+    # Impute numeric columns with median
+    if numeric_cols:
+        imputer_num = SimpleImputer(strategy="median")
+        X_combined_imputed[numeric_cols] = imputer_num.fit_transform(X_combined_imputed[numeric_cols])
+
+    # Impute categorical columns with most_frequent
+    if categorical_cols:
+        imputer_cat = SimpleImputer(strategy="most_frequent")
+        X_combined_imputed[categorical_cols] = imputer_cat.fit_transform(X_combined_imputed[categorical_cols])
+
+    logger.info(f"    Imputed {len(numeric_cols)} numeric columns, {len(categorical_cols)} categorical columns")
 
     # Apply SMOTE if available
     if SMOTETomek is None:
