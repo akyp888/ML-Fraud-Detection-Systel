@@ -679,6 +679,12 @@ def resample_train_val_combined(
     X_combined = combined.drop(columns=[cfg.label_col], errors="ignore")
     y_combined = combined[cfg.label_col].values.astype(int)
 
+    # Impute missing values before SMOTE (SMOTE cannot handle NaN)
+    logger.info("  Imputing missing values before SMOTE...")
+    imputer = SimpleImputer(strategy="median")
+    X_combined_imputed = imputer.fit_transform(X_combined)
+    X_combined_imputed = pd.DataFrame(X_combined_imputed, columns=X_combined.columns)
+
     # Apply SMOTE if available
     if SMOTETomek is None:
         logger.warning("SMOTE not available; returning original train/val without resampling")
@@ -687,7 +693,7 @@ def resample_train_val_combined(
     logger.info("  Applying SMOTE + TomekLinks to create synthetic fraud cases...")
     try:
         sampler = SMOTETomek(random_state=cfg.random_state)
-        X_resampled, y_resampled = sampler.fit_resample(X_combined, y_combined)
+        X_resampled, y_resampled = sampler.fit_resample(X_combined_imputed, y_combined)
         X_resampled = pd.DataFrame(X_resampled, columns=X_combined.columns)
     except Exception as e:
         logger.warning(f"  SMOTE failed ({e}); returning original train/val")
