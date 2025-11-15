@@ -1913,27 +1913,39 @@ def train_xgboost(
     # Step 3: Train with early stopping
     logger.info("Step 3: Training XGBoost with early stopping on validation set")
     try:
-        # Try newer XGBoost API (2.0+) with callbacks
+        # Try XGBoost 2.1+ callback API (xgboost.callback.EarlyStopping)
         try:
-            from xgboost import early_stopping
-            logger.info("Using XGBoost 2.0+ callbacks API for early stopping")
+            from xgboost.callback import EarlyStopping
+            logger.info("Using XGBoost 2.1+ EarlyStopping callback API")
             xgb.fit(
                 X_train,
                 y_train,
                 eval_set=[(X_val, y_val)],
-                callbacks=[early_stopping(rounds=50, metric_name='logloss')],
+                callbacks=[EarlyStopping(rounds=50, metric_name='logloss')],
                 verbose=False
             )
-        except (ImportError, TypeError) as e_new:
-            # Fallback to older XGBoost API
-            logger.info(f"XGBoost 2.0+ API failed ({type(e_new).__name__}); trying older API")
-            xgb.fit(
-                X_train,
-                y_train,
-                eval_set=[(X_val, y_val)],
-                early_stopping_rounds=50,
-                verbose=False
-            )
+        except (ImportError, AttributeError, TypeError) as e_new:
+            # Try alternative XGBoost 2.0 import
+            try:
+                from xgboost import early_stopping
+                logger.info("Using XGBoost 2.0 early_stopping callback API")
+                xgb.fit(
+                    X_train,
+                    y_train,
+                    eval_set=[(X_val, y_val)],
+                    callbacks=[early_stopping(rounds=50, metric_name='logloss')],
+                    verbose=False
+                )
+            except (ImportError, TypeError, AttributeError) as e_alt:
+                # Fallback: Train without early stopping (just use eval_set for monitoring)
+                logger.warning(f"Early stopping callback not available; training without early stopping")
+                logger.info(f"XGBoost version detection note: tried 2.1+ and 2.0 callback APIs")
+                xgb.fit(
+                    X_train,
+                    y_train,
+                    eval_set=[(X_val, y_val)],
+                    verbose=False
+                )
 
         # Log training completion
         if hasattr(xgb, 'best_iteration'):
