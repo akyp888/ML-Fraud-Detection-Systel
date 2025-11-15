@@ -659,12 +659,18 @@ def resample_train_val_combined_after_encoding(
     - Works on already-encoded numeric data (no categorical string issues)
     - Standard production ML pipeline approach
     - Handles unknown actual data characteristics (encoding is data-agnostic)
+    - Adaptive k_neighbors for extremely small minority classes
 
     Steps:
     1. Combine train + val encoded features and labels
-    2. Apply SMOTE + TomekLinks to create synthetic fraud cases
+    2. Apply SMOTE + TomekLinks to create synthetic fraud cases (with adaptive k_neighbors)
     3. Re-split combined resampled data back into train/val using original proportions
     4. Return resampled X_train, X_val, y_train, y_val as numpy arrays
+
+    Adaptive k_neighbors strategy:
+    - Default SMOTE uses k_neighbors=5, which requires >= 6 minority samples
+    - For extreme imbalance (< 5 minority samples), adaptively reduce k_neighbors
+    - Falls back to pure SMOTE if SMOTETomek fails (no undersampling)
 
     Note: Test set is NOT resampled (kept pure for final evaluation).
     """
@@ -683,6 +689,10 @@ def resample_train_val_combined_after_encoding(
     X_combined = np.vstack([X_train, X_val])
     y_combined = np.concatenate([y_train, y_val])
 
+    # Calculate number of minority samples
+    n_minority = int(y_combined.sum())
+    logger.info(f"  Total minority (fraud) samples in combined: {n_minority}")
+
     # Apply SMOTE if available
     if SMOTETomek is None:
         logger.warning("SMOTE not available; returning original train/val without resampling")
@@ -690,11 +700,23 @@ def resample_train_val_combined_after_encoding(
 
     logger.info("  Applying SMOTE + TomekLinks to create synthetic fraud cases...")
     try:
-        sampler = SMOTETomek(random_state=cfg.random_state)
+        # Adaptive k_neighbors: use min(5, n_minority - 1) to handle very small minority classes
+        # SMOTE default k_neighbors=5, but needs at least 1 for algorithm to work
+        k_neighbors = max(1, min(5, n_minority - 1)) if n_minority > 1 else 1
+        logger.info(f"    Using k_neighbors={k_neighbors} (adaptive for {n_minority} minority samples)")
+
+        sampler = SMOTETomek(k_neighbors=k_neighbors, random_state=cfg.random_state)
         X_resampled, y_resampled = sampler.fit_resample(X_combined, y_combined)
     except Exception as e:
-        logger.warning(f"  SMOTE failed ({e}); returning original train/val")
-        return X_train, X_val, y_train, y_val
+        logger.warning(f"  SMOTE+TomekLinks failed ({e}); attempting pure SMOTE without undersampling...")
+        try:
+            k_neighbors = max(1, min(5, n_minority - 1)) if n_minority > 1 else 1
+            sampler = SMOTE(k_neighbors=k_neighbors, random_state=cfg.random_state)
+            X_resampled, y_resampled = sampler.fit_resample(X_combined, y_combined)
+            logger.info(f"    Pure SMOTE succeeded with k_neighbors={k_neighbors}")
+        except Exception as e2:
+            logger.warning(f"  Pure SMOTE also failed ({e2}); returning original train/val")
+            return X_train, X_val, y_train, y_val
 
     new_total_size = len(X_resampled)
     logger.info(f"  After SMOTE: {new_total_size} rows (created {new_total_size - total_size} synthetic fraud cases)")
