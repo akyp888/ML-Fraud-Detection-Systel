@@ -10,7 +10,7 @@ for fraud detection. It is designed to:
 - Intentionally "mess up" the data to simulate noisy, real-world conditions
 - Merge transactions with ECM outcomes and create a clean binary label
 - Engineer strong transactional + entity / graph-like features
-- Handle extreme class imbalance with advanced resampling (SMOTE-Tomek + BorderlineSMOTE)
+- Handle extreme class imbalance with advanced resampling (SMOTE-Tomek, etc.)
 - Train multiple tree-based models with regularization:
     - RandomForest (scikit-learn)
     - LightGBM (optional, if installed)
@@ -56,14 +56,11 @@ from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.utils.class_weight import compute_class_weight
 
 # Optional dependencies --------------------------------------------------------
 try:
-    import lightgbm as lgb  # full package, for callbacks
     from lightgbm import LGBMClassifier  # type: ignore
 except Exception:
-    lgb = None
     LGBMClassifier = None
 
 try:
@@ -101,12 +98,12 @@ logger.addHandler(_handler)
 @dataclass
 class Config:
     base_dir: Path = Path(__file__).resolve().parent
-    data_dir: Path = Path(__file__).resolve().parent / "local_data" / "sample"
-    sample_dir: Path = Path(__file__).resolve().parent / "local_data" / "sample"
+    data_dir: Path = Path(__file__).resolve().parent / "local_data/sample"
+    sample_dir: Path = Path(__file__).resolve().parent / "local_data/sample"
     transactions_jsonl: str = "transactions.jsonl"
     ecm_jsonl: str = "ecm.jsonl"
 
-    # Columns
+    # Columns (these should match your real schema if present)
     label_col: str = "label"
     ecm_label_col: str = "FRAUD_STATE"   # column in ECM table to derive label from
     trx_id_col: str = "CORRELATIVE_NO"
@@ -134,13 +131,48 @@ class Config:
     use_smote_tomek: bool = True
     smote_kind: str = "borderline"  # or "regular"
 
-    # RandomForest hyperparams (for warm_start training)
+    # Misc
+    verbose_reports: bool = True
+
+    # RandomForest controls (exposed so we can tune speed quickly)
     rf_n_estimators: int = 200
     rf_warm_start_chunk: int = 50
     rf_n_jobs: int = -1
 
-    # Misc
-    verbose_reports: bool = True
+
+def _parse_bool_env(value: str) -> bool:
+    val = value.strip().lower()
+    if val in {"1", "true", "yes", "y", "on"}:
+        return True
+    if val in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"Cannot parse boolean env value '{value}'")
+
+
+def apply_env_overrides(cfg: Config) -> Config:
+    """
+    Allow quick tuning without editing the script by honoring a few env vars.
+    """
+    env_map: Dict[str, Tuple[str, Any]] = {
+        "RF_N_ESTIMATORS": ("rf_n_estimators", int),
+        "RF_WARM_CHUNK": ("rf_warm_start_chunk", int),
+        "RF_N_JOBS": ("rf_n_jobs", int),
+        "USE_SMOTE_TOMEK": ("use_smote_tomek", _parse_bool_env),
+    }
+
+    for env_key, (field_name, caster) in env_map.items():
+        raw_val = os.getenv(env_key)
+        if raw_val is None:
+            continue
+        try:
+            new_val = caster(raw_val)
+            setattr(cfg, field_name, new_val)
+            logger.info(f"Overriding config via ${env_key}: {field_name}={new_val}")
+        except Exception as exc:  # noqa: BLE001 - log helpful context
+            logger.warning(
+                "Failed to apply env override %s=%s: %s", env_key, raw_val, exc
+            )
+    return cfg
 
 
 # ------------------------------------------------------------------------------
@@ -273,6 +305,8 @@ def make_data_messy(
 def load_sample_jsonl(cfg: Config) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Load transactions.jsonl and ecm.jsonl from cfg.sample_dir.
+
+    Raises if they don't exist (we can later add synthetic generation if needed).
     """
     trx_path = cfg.sample_dir / cfg.transactions_jsonl
     ecm_path = cfg.sample_dir / cfg.ecm_jsonl
@@ -379,7 +413,9 @@ def merge_trx_and_ecm(
 
     label_series = merged[cfg.ecm_label_col].astype(str).str.upper().str.strip()
     is_fraud = label_series.str.contains("FRAUD")
-    # treat unknown as non-fraud by default
+    is_genuine = label_series.str.contains("GENUINE") | label_series.str.contains("LEGIT")
+
+    # Default: unknown/other treated as non-fraud (can be tuned)
     merged[cfg.label_col] = np.where(is_fraud, 1, 0)
 
     logger.info(
@@ -520,7 +556,7 @@ def compute_entity_fraud_stats(
         [entity_col, entity_col + "_FRAUD_COUNT", "_TOTAL_COUNT", "_FRAUD_RATE"]
     """
     stats_dict: Dict[str, pd.DataFrame] = {}
-    _ = train[cfg.label_col].astype(int)
+    y = train[cfg.label_col].astype(int)
 
     for col in entity_cols:
         if col not in train.columns:
@@ -610,7 +646,7 @@ def build_feature_matrix(
     val_fe: pd.DataFrame,
     test_fe: pd.DataFrame,
     cfg: Config,
-) -> Tuple[Any, np.ndarray, Any, np.ndarray, Any, np.ndarray, Pipeline]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, Pipeline]:
     """
     Build X/y for train/val/test using a scikit-learn ColumnTransformer pipeline.
 
@@ -659,6 +695,7 @@ def build_feature_matrix(
     numeric_transformer = Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="median")),
+            # Tree models don't strictly need scaling; we keep raw scale.
         ]
     )
 
@@ -688,13 +725,14 @@ def build_feature_matrix(
         ]
     )
 
+    # Build full pipeline with a placeholder classifier (we'll fit separate models)
     model_pipeline = Pipeline(
         steps=[
             ("preprocessor", preprocessor),
         ]
     )
 
-    # Build full X/y sets
+    # Fit preprocessor only on train
     X_train = train_fe[feature_cols]
     y_train = train_fe[cfg.label_col].values.astype(int)
 
@@ -742,9 +780,9 @@ def resample_training_data(
 
     Preferred: SMOTE-Tomek with BorderlineSMOTE (focusing on decision boundary).
     Fallbacks:
-        - Manual BorderlineSMOTE + TomekLinks (when BorderlineSMOTE cannot be plugged into SMOTETomek)
+        - Manual BorderlineSMOTE + TomekLinks (when the new imblearn API rejects BorderlineSMOTE)
         - Standard SMOTE-Tomek
-        - Original data if resamplers are missing
+        - Return original data if imblearn pieces are unavailable
     """
 
     if not cfg.use_smote_tomek:
@@ -766,10 +804,7 @@ def resample_training_data(
             random_state=cfg.random_state,
             kind="borderline-1",
         )
-        start = time.time()
         X_smote, y_smote = sampler.fit_resample(X_train, y_train)
-        elapsed = time.time() - start
-        logger.info("BorderlineSMOTE step elapsed=%.1fs", elapsed)
         if TomekLinks is not None:
             tomek = TomekLinks()
             X_clean, y_clean = tomek.fit_resample(X_smote, y_smote)
@@ -789,13 +824,10 @@ def resample_training_data(
                             kind="borderline-1",
                         ),
                     )
-                    start = time.time()
                     X_res, y_res = sampler.fit_resample(X_train, y_train)
-                    elapsed = time.time() - start
-                    logger.info("SMOTETomek (Borderline) elapsed=%.1fs", elapsed)
                     return _log_and_return(X_res, y_res, "SMOTETomek (Borderline)")
             except TypeError:
-                # Some imblearn versions wrap SMOTE in special types and issubclass fails.
+                # Some imblearn versions wrap SMOTE with special typing objects
                 pass
         if BorderlineSMOTE is not None:
             return _apply_borderline_then_tomek()
@@ -813,10 +845,7 @@ def resample_training_data(
         random_state=cfg.random_state,
         smote=smote_estimator,
     )
-    start = time.time()
     X_res, y_res = sampler.fit_resample(X_train, y_train)
-    elapsed = time.time() - start
-    logger.info("SMOTETomek elapsed=%.1fs", elapsed)
     return _log_and_return(X_res, y_res, "SMOTETomek")
 
 
@@ -834,6 +863,7 @@ def find_best_threshold(
     Returns (best_threshold, best_f_beta).
     """
     precision, recall, thresholds = precision_recall_curve(y_true, y_proba)
+    # precision, recall length = len(thresholds) + 1
     thresholds = np.append(thresholds, 1.0)  # align lengths
 
     best_t = 0.5
@@ -890,20 +920,20 @@ def evaluate_model(
         val_proba = model.predict_proba(X_val)[:, 1]
         test_proba = model.predict_proba(X_test)[:, 1]
     elif hasattr(model, "decision_function"):
-                val_scores = model.decision_function(X_val)
-                test_scores = model.decision_function(X_test)
-                # normalize scores to [0,1] via min-max
-                v_min, v_max = val_scores.min(), val_scores.max()
-                t_min, t_max = test_scores.min(), test_scores.max()
-                val_proba = (val_scores - v_min) / (v_max - v_min + 1e-9)
-                test_proba = (test_scores - t_min) / (t_max - t_min + 1e-9)
+        val_scores = model.decision_function(X_val)
+        test_scores = model.decision_function(X_test)
+        # map scores to 0-1 via min-max for approximate probabilities
+        val_min, val_max = val_scores.min(), val_scores.max()
+        test_min, test_max = test_scores.min(), test_scores.max()
+        val_proba = (val_scores - val_min) / (val_max - val_min + 1e-9)
+        test_proba = (test_scores - test_min) / (test_max - test_min + 1e-9)
     else:
-        raise ValueError(f"Model {name} does not support predict_proba or decision_function")
+        raise ValueError(f"Model {name} has neither predict_proba nor decision_function")
 
     # AUC / PR-AUC
     val_auc = roc_auc_score(y_val, val_proba)
-    test_auc = roc_auc_score(y_test, test_proba)
     val_ap = average_precision_score(y_val, val_proba)
+    test_auc = roc_auc_score(y_test, test_proba)
     test_ap = average_precision_score(y_test, test_proba)
 
     logger.info(
@@ -911,7 +941,7 @@ def evaluate_model(
         f"Test AUC={test_auc:.4f}, PR-AUC={test_ap:.4f}"
     )
 
-    # Threshold tuning on validation set
+    # Threshold tuning on validation
     best_t, best_f_beta = find_best_threshold(y_val, val_proba, beta=cfg.f_beta)
     logger.info(
         f"[{name}] Best threshold (F_{cfg.f_beta:.1f} on val) = {best_t:.4f}, "
@@ -927,49 +957,40 @@ def evaluate_model(
 
     logger.info(f"[{name}] Validation F1={val_f1:.4f}, Test F1={test_f1:.4f}")
 
-    # Classification reports
     if cfg.verbose_reports:
-        val_report = classification_report(y_val, val_pred, digits=4)
-        test_report = classification_report(y_test, test_pred, digits=4)
         logger.info(f"[{name}] Classification report (Validation):")
-        logger.info("\n" + val_report)
-        logger.info(f"[{name}] Classification report (Test):")
-        logger.info("\n" + test_report)
-    else:
-        val_report = ""
-        test_report = ""
+        logger.info("\n" + classification_report(y_val, val_pred, digits=3))
 
-    # Precision@K (top fraction of test scores)
-    k, prec_k, rec_k = precision_recall_at_k(
-        y_test,
-        test_proba,
-        frac=cfg.top_k_frac,
-    )
+        logger.info(f"[{name}] Classification report (Test):")
+        logger.info("\n" + classification_report(y_test, test_pred, digits=3))
+
+    # Precision@K on test
+    k, prec_k, rec_k = precision_recall_at_k(y_test, test_proba, frac=cfg.top_k_frac)
     logger.info(
         f"[{name}] Precision@top-{cfg.top_k_frac*100:.1f}% (K={k}): "
         f"precision={prec_k:.4f}, recall={rec_k:.4f}"
     )
 
     metrics = {
+        "name": name,
         "val_auc": val_auc,
-        "test_auc": test_auc,
         "val_ap": val_ap,
+        "val_f1": val_f1,
+        "test_auc": test_auc,
         "test_ap": test_ap,
-        "val_f1_at_best_t": val_f1,
-        "test_f1_at_best_t": test_f1,
+        "test_f1": test_f1,
         "best_threshold": best_t,
-        "best_f_beta": best_f_beta,
+        "best_f_beta_val": best_f_beta,
         "precision_at_k": prec_k,
         "recall_at_k": rec_k,
         "k": k,
-        "val_report": val_report,
-        "test_report": test_report,
     }
+
     return metrics
 
 
 # ------------------------------------------------------------------------------
-# Model training: RandomForest, LightGBM, XGBoost
+# Model training
 # ------------------------------------------------------------------------------
 
 def train_random_forest(
@@ -981,38 +1002,12 @@ def train_random_forest(
 ):
     """
     Train a reasonably regularized RandomForestClassifier.
-    Uses warm_start in chunks and explicit class weights to avoid the
-    warm_start + 'balanced_subsample' warning.
     """
     logger.info("=" * 70)
     logger.info("Training RandomForestClassifier (regularized)")
-
-    # How many trees in total, and how many per warm-start chunk
     total_trees = max(1, int(cfg.rf_n_estimators))
     chunk = max(1, min(int(cfg.rf_warm_start_chunk), total_trees))
     warm = total_trees > chunk
-
-    # ------------------------------------------------------------------
-    # Compute explicit class weights instead of 'balanced_subsample'
-    # ------------------------------------------------------------------
-    y_arr = np.asarray(y_train)
-    unique_classes = np.unique(y_arr)
-
-    class_weight = None
-    if len(unique_classes) > 1:
-        weights = compute_class_weight(
-            class_weight="balanced",
-            classes=unique_classes,
-            y=y_arr,
-        )
-        class_weight = {cls: w for cls, w in zip(unique_classes, weights)}
-        logger.info("RandomForest class_weight mapping: %s", class_weight)
-    else:
-        logger.warning(
-            "RandomForest y_train has only one class (%s); "
-            "skipping class_weight.",
-            unique_classes[0],
-        )
 
     rf = RandomForestClassifier(
         n_estimators=chunk if warm else total_trees,
@@ -1020,27 +1015,21 @@ def train_random_forest(
         min_samples_split=50,
         min_samples_leaf=20,
         max_features="sqrt",
-        n_jobs=int(cfg.rf_n_jobs),
-        class_weight=class_weight,
-        random_state=int(cfg.random_state),
+        n_jobs=cfg.rf_n_jobs,
+        class_weight="balanced_subsample",
+        random_state=cfg.random_state,
         warm_start=warm,
     )
 
-    # ------------------------------------------------------------------
-    # Warm-start loop: build trees in chunks, logging progress
-    # ------------------------------------------------------------------
     trees_built = 0
     overall_start = time.time()
-
     while trees_built < total_trees:
         target_trees = min(total_trees, trees_built + chunk)
         rf.set_params(n_estimators=target_trees)
-
         start = time.time()
         rf.fit(X_train, y_train)
-        duration = time.time() - start
-
         trees_built = target_trees
+        duration = time.time() - start
         logger.info(
             "  -> RandomForest progress: %d/%d trees (%.1fs this chunk)",
             trees_built,
@@ -1062,8 +1051,7 @@ def train_lightgbm(
     cfg: Config,
 ):
     """
-    Train a LightGBM model with early stopping and regularization.
-    Uses LightGBM >= 4.0 callback API for early stopping.
+    Train a LightGBM model with early stopping and regularization (if LightGBM available).
     """
     if LGBMClassifier is None:
         logger.warning("LightGBM not installed; skipping LGBM model.")
@@ -1071,28 +1059,6 @@ def train_lightgbm(
 
     logger.info("=" * 70)
     logger.info("Training LightGBMClassifier (regularized + early stopping)")
-
-    # ------------------------------------------------------------------
-    # Handle class imbalance via scale_pos_weight / is_unbalance
-    # ------------------------------------------------------------------
-    y_arr = np.asarray(y_train)
-    pos = int(y_arr.sum())
-    neg = int(len(y_arr) - pos)
-
-    if pos > 0 and neg > 0:
-        scale_pos_weight = neg / float(pos)
-        logger.info(
-            "LightGBM scale_pos_weight computed as neg/pos = %d/%d = %.4f",
-            neg,
-            pos,
-            scale_pos_weight,
-        )
-    else:
-        scale_pos_weight = 1.0
-        logger.warning(
-            "LightGBM got y_train with only one class; "
-            "using scale_pos_weight=1.0"
-        )
 
     lgbm = LGBMClassifier(
         n_estimators=1000,
@@ -1105,46 +1071,19 @@ def train_lightgbm(
         reg_lambda=0.5,
         min_child_samples=50,
         objective="binary",
-        # for binary classification, use scale_pos_weight / is_unbalance
-        is_unbalance=True,
-        scale_pos_weight=scale_pos_weight,
-        random_state=int(cfg.random_state),
+        class_weight="balanced",
+        random_state=cfg.random_state,
         n_jobs=-1,
     )
 
-    # ------------------------------------------------------------------
-    # LightGBM >= 4.0 early stopping via callbacks
-    # ------------------------------------------------------------------
-    callbacks = []
-    if "lgb" in globals() and lgb is not None:
-        callbacks = [
-            lgb.early_stopping(stopping_rounds=50, verbose=True),
-            lgb.log_evaluation(period=10),
-        ]
-        logger.info("Using LightGBM callbacks for early stopping.")
-    else:
-        logger.warning(
-            "Full `lightgbm` package not available; "
-            "fitting without early stopping callbacks."
-        )
-
-    if callbacks:
-        lgbm.fit(
-            X_train,
-            y_train,
-            eval_set=[(X_val, y_val)],
-            eval_metric="auc",
-            callbacks=callbacks,
-        )
-    else:
-        # Fallback: no early stopping, but still evaluate on val
-        lgbm.fit(
-            X_train,
-            y_train,
-            eval_set=[(X_val, y_val)],
-            eval_metric="auc",
-        )
-
+    lgbm.fit(
+        X_train,
+        y_train,
+        eval_set=[(X_val, y_val)],
+        eval_metric="auc",
+        early_stopping_rounds=50,
+        verbose=False,
+    )
     return lgbm
 
 
@@ -1156,7 +1095,7 @@ def train_xgboost(
     cfg: Config,
 ):
     """
-    Train an XGBoostClassifier with regularization & early stopping (if available).
+    Train an XGBoost binary classifier with early stopping and regularization.
     """
     if XGBClassifier is None:
         logger.warning("XGBoost not installed; skipping XGBoost model.")
@@ -1164,25 +1103,6 @@ def train_xgboost(
 
     logger.info("=" * 70)
     logger.info("Training XGBoostClassifier (regularized + early stopping)")
-
-    y_arr = np.asarray(y_train)
-    pos = int(y_arr.sum())
-    neg = int(len(y_arr) - pos)
-
-    if pos > 0 and neg > 0:
-        scale_pos_weight = neg / float(pos)
-        logger.info(
-            "XGBoost scale_pos_weight computed as neg/pos = %d/%d = %.4f",
-            neg,
-            pos,
-            scale_pos_weight,
-        )
-    else:
-        scale_pos_weight = 1.0
-        logger.warning(
-            "XGBoost got y_train with only one class; "
-            "using scale_pos_weight=1.0"
-        )
 
     xgb = XGBClassifier(
         n_estimators=1000,
@@ -1197,19 +1117,16 @@ def train_xgboost(
         tree_method="hist",
         n_jobs=-1,
         eval_metric="auc",
-        random_state=int(cfg.random_state),
-        scale_pos_weight=scale_pos_weight,
-        use_label_encoder=False,
+        random_state=cfg.random_state,
     )
 
     xgb.fit(
         X_train,
         y_train,
         eval_set=[(X_val, y_val)],
-        verbose=True,
         early_stopping_rounds=50,
+        verbose=False,
     )
-
     return xgb
 
 
@@ -1219,48 +1136,38 @@ def train_xgboost(
 
 def run_pipeline(cfg: Config) -> Dict[str, Dict[str, Any]]:
     """
-    Full local pipeline:
-    - Load data
-    - Clean / normalize
-    - Mess up data
-    - Merge & label
-    - Split train/val/test
-    - Feature engineering
-    - Preprocessing / feature matrix
-    - SMOTE-Tomek resampling (optional)
-    - Train RF / LGBM / XGB
-    - Evaluate each model
+    Orchestrate the full pipeline end-to-end.
+
+    Returns a dict: model_name -> metrics dict.
     """
     logger.info("=" * 70)
     logger.info("TECHM FRAUD DETECTION PIPELINE - GOD TIER LOCAL VERSION")
     logger.info("=" * 70)
-    logger.info("Config: " + json.dumps(asdict(cfg), indent=2, default=str))
+    logger.info(f"Config: {json.dumps({k: str(v) for k, v in asdict(cfg).items()}, indent=2)}")
 
-    rng = np.random.RandomState(cfg.random_state)
-
-    # Make sure directories exist
+    # Ensure data dir exists
     cfg.data_dir.mkdir(parents=True, exist_ok=True)
-    cfg.sample_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1) Load raw JSONL
+    # 1. Load JSONL sample data
     df_trx_raw, df_ecm_raw = load_sample_jsonl(cfg)
 
-    # 2) Clean / normalize
+    # 2. Normalize types
     df_trx_clean, df_ecm_clean = clean_and_normalize_raw(df_trx_raw, df_ecm_raw, cfg)
 
-    # 3) Make data messy for robustness testing
+    # 3. Make data messy/noisy (in-memory only)
+    rng = np.random.RandomState(cfg.random_state)
     df_trx_messy, df_ecm_messy = make_data_messy(df_trx_clean, df_ecm_clean, cfg, rng)
 
-    # 4) Merge & label
+    # 4. Merge and label
     merged = merge_trx_and_ecm(df_trx_messy, df_ecm_messy, cfg)
 
-    # 5) Split train/val/test
+    # 5. Split train/val/test
     train_df, val_df, test_df = split_train_val_test(merged, cfg)
 
-    # 6) Feature engineering
+    # 6. Feature engineering
     train_fe, val_fe, test_fe = engineer_features(train_df, val_df, test_df, cfg)
 
-    # 7) Preprocessing / feature matrix
+    # 7. Build feature matrices
     (
         X_train,
         y_train,
@@ -1271,13 +1178,12 @@ def run_pipeline(cfg: Config) -> Dict[str, Dict[str, Any]]:
         preprocess_pipeline,
     ) = build_feature_matrix(train_fe, val_fe, test_fe, cfg)
 
-    # 8) Resample training data (SMOTE-Tomek + BorderlineSMOTE)
+    # 8. Resample training data for imbalance
     X_train_res, y_train_res = resample_training_data(X_train, y_train, cfg)
 
-    # 9) Train models
-    metrics_by_model: Dict[str, Dict[str, Any]] = {}
+    results: Dict[str, Dict[str, Any]] = {}
 
-    # RandomForest
+    # 9. Train & evaluate RandomForest
     rf = train_random_forest(X_train_res, y_train_res, X_val, y_val, cfg)
     rf_metrics = evaluate_model(
         "RandomForest",
@@ -1288,9 +1194,9 @@ def run_pipeline(cfg: Config) -> Dict[str, Dict[str, Any]]:
         y_test,
         cfg,
     )
-    metrics_by_model["RandomForest"] = rf_metrics
+    results["RandomForest"] = rf_metrics
 
-    # LightGBM
+    # 10. Train & evaluate LightGBM
     lgbm = train_lightgbm(X_train_res, y_train_res, X_val, y_val, cfg)
     if lgbm is not None:
         lgbm_metrics = evaluate_model(
@@ -1302,9 +1208,9 @@ def run_pipeline(cfg: Config) -> Dict[str, Dict[str, Any]]:
             y_test,
             cfg,
         )
-        metrics_by_model["LightGBM"] = lgbm_metrics
+        results["LightGBM"] = lgbm_metrics
 
-    # XGBoost
+    # 11. Train & evaluate XGBoost
     xgb = train_xgboost(X_train_res, y_train_res, X_val, y_val, cfg)
     if xgb is not None:
         xgb_metrics = evaluate_model(
@@ -1316,18 +1222,20 @@ def run_pipeline(cfg: Config) -> Dict[str, Dict[str, Any]]:
             y_test,
             cfg,
         )
-        metrics_by_model["XGBoost"] = xgb_metrics
+        results["XGBoost"] = xgb_metrics
 
     logger.info("=" * 70)
     logger.info("PIPELINE EXECUTION COMPLETE!")
     logger.info("=" * 70)
-    logger.info("Models trained: %s", list(metrics_by_model.keys()))
-    return metrics_by_model
+    logger.info(f"Models trained: {list(results.keys())}")
+
+    return results
 
 
 def main() -> None:
     seed_everything(42)
     cfg = Config()
+    cfg = apply_env_overrides(cfg)
     run_pipeline(cfg)
 
 
