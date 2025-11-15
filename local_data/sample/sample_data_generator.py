@@ -1,0 +1,674 @@
+#!/usr/bin/env python3
+"""
+Generate synthetic sample data for:
+  - T_RT_FRD_JUMP_TRX  -> transactions.jsonl
+  - T_RT_FRD_JUMP_ECM_TRX -> ecm.jsonl
+
+All fields are exactly those from the data dictionary you provided.
+No extra fields, no missing fields.
+
+Usage:
+    python generate_sample_jsonl.py \
+        --n-transactions 200000 \
+        --fraud-ratio 0.000037 \
+        --out-dir ./local_data/sample
+
+fraud_ratio is a FRACTION (not %):
+  - 0.000037  ~ 0.0037%
+  - 0.00037   ~ 0.037%
+"""
+
+import argparse
+import json
+import os
+from pathlib import Path
+from datetime import datetime, timedelta
+import random
+import string
+from typing import Dict, Any, List
+
+
+# ---------------------------------------------------------------------------
+# 1. Schema definition (exact field names + raw type labels from dictionary)
+# ---------------------------------------------------------------------------
+
+TRX_FIELD_TYPES: Dict[str, str] = {
+    # ------------- From T_RT_FRD_JUMP_TRX-357 -----------------
+    "RT_FRD_JUMP_KEY": "INTEGER",
+    "SOURCE_ID": "VARCHAR2(100)",
+    "SOURCE_CD": "VARCHAR2(50)",
+    "AUDIT_DT": "DATE",
+    "LAST_UPD_DT": "DATE",
+    "LOG_YEAR": "INTEGER",
+    "LOG_MONTH": "INTEGER",
+    "LOG_DAY": "INTEGER",
+    "SEND_DATE": "INTEGER",
+    "SEND_HOUR": "INTEGER",
+    "RECEPTION_DATE": "INTEGER",
+    "RECEPTION_HOUR": "INTEGER",
+    "GENDER_ALERT_IND": "VARCHAR2(5)",
+    "ENTITY_CD": "VARCHAR2(50)",
+    "CUSTOMER_NO": "VARCHAR2(50)",
+    "INTERNET_USER_CD": "VARCHAR2(50)",
+    "COLPATRIA_DOCUMENT_TYPE_NAME": "VARCHAR2(200)",
+    "CLIENT_CD": "VARCHAR2(50)",
+    "AUTHN_TYPE_COLPATRIA_NAME": "VARCHAR2(200)",
+    "COLPATRIA_AUTHN_RESPONSE_CD": "VARCHAR2(50)",
+    "TRX_ORIGIN_CD": "VARCHAR2(50)",
+    "OTP_IND": "VARCHAR2(5)",
+    "CHALLENGE_QUESTIONS_SENT_IND": "VARCHAR2(5)",
+    "CORRECT_ANSWERS_PR_IND": "VARCHAR2(5)",
+    "DEVICE_PATTERN_DESC": "VARCHAR2(500)",
+    "PERCENTAGE_OF_SIMILARITY_PCT": "VARCHAR2(10)",
+    "TYPE_PERSON_IND": "VARCHAR2(5)",
+    "HOST_RESPONSE_CD": "VARCHAR2(50)",
+    "TRX_GROUP_CD": "VARCHAR2(50)",
+    "LOCAL_OR_INTERNATIONAL_CD": "VARCHAR2(50)",
+    "PRODUCT_CD": "VARCHAR2(50)",
+    "SUBPRODUCT_CD": "VARCHAR2(50)",
+    "ACC_PRODUCT_NO": "VARCHAR2(50)",
+    "ORG_ACC_OP_BRANCH_CD": "VARCHAR2(50)",
+    "EXEC_ACC_ORG_CHANNEL_CD": "VARCHAR2(50)",
+    "REVERSE_IND": "VARCHAR2(5)",
+    "TRX_DATE": "INTEGER",
+    "TRX_HOUR": "INTEGER",
+    "TRX_DT": "VARCHAR2(19)",
+    "CONNECTION_IP_NO": "VARCHAR2(50)",
+    "CITY_OR_LOCATION_NAME": "VARCHAR2(200)",
+    "IP_COUNTRY_CD": "VARCHAR2(50)",
+    "IP_REGION_NAME": "VARCHAR2(200)",
+    "IP_REGION_CD": "VARCHAR2(50)",
+    "LOCAL_IP_ADDRESS_NO": "VARCHAR2(50)",
+    "INT_SERVICE_PROVIDER_NAME": "VARCHAR2(250)",
+    "LANGUAGE_CD": "VARCHAR2(50)",
+    "USER_CONFIRM_CD": "VARCHAR2(50)",
+    "LAST_MOVEMENT_ACCOUNT_DATE": "VARCHAR2(19)",
+    "ACCOUNT_OPENING_DATE": "VARCHAR2(19)",
+    "MARK_VIP_ACCOUNT_TYPE_CD": "VARCHAR2(50)",
+    "DIAL_REGISTERED_INT_ACC_CD": "VARCHAR2(50)",
+    "COLPATRIA_ACCOUNT_NO": "VARCHAR2(50)",
+    "CURRENCY_CD": "VARCHAR2(50)",
+    "TRX_TOTAL_AMT": "DECIMAL(22,4)",
+    "TRX_US_DOLLARS_AMT": "DECIMAL(22,4)",
+    "EXCHANGE_RATE": "DECIMAL(22,12)",
+    "DESTINATION_ACCOUNT_NO": "VARCHAR2(50)",
+    "CLIENT_NAME": "VARCHAR2(200)",
+    "DST_ACC_PLACE_NAME": "VARCHAR2(200)",
+    "CLIENT_RIM_TARGET_CD": "VARCHAR2(50)",
+    "DST_ACC_BRANCH_NAME": "VARCHAR2(200)",
+    "ACC_HOLDER_DST_NAME": "VARCHAR2(200)",
+    "DST_ACC_TEL_NO": "VARCHAR2(50)",
+    "DST_ACC_EMAIL_LINE": "VARCHAR2(500)",
+    "DST_ACC_OP_DATE": "VARCHAR2(19)",
+    "TARGET_BANK_CD": "VARCHAR2(50)",
+    "DESTINATION_PRODUCT_TYPE_CD": "VARCHAR2(50)",
+    "DESTINATION_COUNTRY_CD": "VARCHAR2(50)",
+    "DEBIT_CREDIT_OR_OTHER_CD": "VARCHAR2(50)",
+    "ACCOUNT_STATUS_PRODUCT_CD": "VARCHAR2(50)",
+    "SIGN_VALUE_BALANCE_IND": "VARCHAR2(5)",
+    "AVAILABLE_AMT": "DECIMAL(22,4)",
+    "HOME_ADDRESS_NAME": "VARCHAR2(350)",
+    "PHONE_RESIDENCE_NO": "VARCHAR2(50)",
+    "PHONE_OFFICE_NO": "VARCHAR2(50)",
+    "PHONE_CELL_NO": "VARCHAR2(50)",
+    "EMAIL_LINE": "VARCHAR2(500)",
+    "EMAIL_DOMAIN_NAME": "VARCHAR2(200)",
+    "CUSTOMER_BONDING_DATE": "VARCHAR2(19)",
+    "CUSTOMER_SEGMENT_NAME": "VARCHAR2(200)",
+    "REFERENCE_NO": "VARCHAR2(50)",
+    "SERVICE_PAYMENT_REF_3_NO": "VARCHAR2(50)",
+    "SERVICE_PAYMENT_REF_4_NO": "VARCHAR2(50)",
+    "MESSAGE_TYPE_CD": "VARCHAR2(50)",
+    "P03_CD": "VARCHAR2(50)",
+    "FUTURE_USE_1_DESC": "VARCHAR2(500)",
+    "FUTURE_USE_2_NO": "VARCHAR2(50)",
+    "FUTURE_USE_3_NO": "VARCHAR2(50)",
+    "FRAUD_IND": "VARCHAR2(5)",
+    "ALERT_SOURCE_CD": "VARCHAR2(50)",
+    "CORRELATIVE_NO": "VARCHAR2(50)",
+    "TYPED_KEYS_NO": "VARCHAR2(50)",
+    "RATE_TYPE_CD": "VARCHAR2(50)",
+    "REAL_TIME_IND": "VARCHAR2(5)",
+    "USER_DEVICE_PATTERN_DDS_NO": "VARCHAR2(115)",
+    "SESSION_ID": "VARCHAR2(100)",
+    "DEVICE_HASH_NO": "VARCHAR2(50)",
+    "HASHINTEGRITY_NO": "VARCHAR2(50)",
+    "COOKIE_TEXT": "VARCHAR2(1000)",
+    "LOCAL_STORAGE_VALUE_TEXT": "VARCHAR2(1000)",
+    "DEVICE_OPERATING_SYSTEM_NO": "VARCHAR2(50)",
+    "DEVICE_NO": "VARCHAR2(50)",
+    "IMEI_NO": "VARCHAR2(50)",
+    "MACADDRESS_NO": "VARCHAR2(50)",
+    "HOSTNAME_NAME": "VARCHAR2(200)",
+    "PATHNAME_NAME": "VARCHAR2(200)",
+    "PROTOCOL_NAME": "VARCHAR2(200)",
+    "CERTIFIED_IDENTIFICATION_DESC": "VARCHAR2(500)",
+    "HASLIEDRESOLUTION_CD": "VARCHAR2(50)",
+    "HASLIEDOS_CD": "VARCHAR2(50)",
+    "HASLIEDBROWSER_CD": "VARCHAR2(50)",
+    "DEVICE_POSITION_NAME": "VARCHAR2(200)",
+    "DEVICE_PRESSURE_NO": "VARCHAR2(50)",
+    "CLIENT_NO": "VARCHAR2(50)",
+    "ACCOUNT_NO": "VARCHAR2(50)",
+    "RESULTING_DBFD_GUID_DESC": "VARCHAR2(500)",
+    "DEVICE_RISK_SCORE": "INTEGER",
+    "BROWSING_HABITS_SCORE": "INTEGER",
+    "COMP_ORG_ACC_SCORE": "INTEGER",
+    "DST_ACC_ANALYSIS_SCORE": "INTEGER",
+    "CONDITIONS_MET_TEXT": "VARCHAR2(1000)",
+    "TRANSACTION_DT": "Date8",
+    "TRANSACTION_DT_TIME": "DATETIME",
+    "EMPLOYEE_ACC_ORI_IND": "VARHCAR1",
+    "SVC_PAYMENT_CDO": "VARCHAR6",
+    "ISTOR_IND": "VARCHAR1",
+    "EMULATOR_IND": "VARCHAR1",
+    "PORT_IND": "VARCHAR10",
+    "HAS_LIEDLANGUAGES_CD": "VARCHAR1",
+    "FIRST_NAME": "VARCHAR50",
+    "SECOND_NAME": "VARCHAR50",
+    "SURNAME": "VARCHAR50",
+    "SECOND_SURNAME": "VARCHAR50",
+    "MARRIED_SURNAME": "VARCHAR25",
+    "GENDER": "VARCHAR1",
+    "CIVIL_STATUS": "VARCHAR1",
+    "BIRTH_DATE": "INTEGER10",
+    "NATIONALITY_NAME": "VARCHAR3",
+    "COUNTRY_BIRTH_NAME": "VARCHAR3",
+    "AGENRO": "VARCHAR3",
+    "COUNTRY_RESIDENCE_NAME": "VARCHAR30",
+    "PROFESSION_NAME": "VARCHAR30",
+    "ECONOMIC_NAME": "VARCHAR50",
+    "DEPENDENCY_RELATIONSHIP_NAME": "VARCHAR1",
+    "COMPANY_WORK_NAME": "VARCHAR50",
+    "DIRECTION_WORK_NAME": "VARCHAR50",
+    "PUBLIC_SERVANT_PEP_NAME": "VARCHAR1",
+    "FAMILY_MEMBER_PEP_NAME": "VARCHAR1",
+    "PEP_COLLABORATOR_NAME": "VARCHAR1",
+    "OS_NAME": "VARCHAR20",
+    "SERIAL_NRO": "VARCHAR20",
+    "APPLICATION_CD": "VARCHAR10",
+    "AUTH_CD": "VARCHAR20",
+    "ZIP_CD": "VARCHAR10",
+    "POSTAL_CD": "VARCHAR5",
+    "MOVEMENT_DEVICE_CD": "VARCHAR1",
+    "DEVICEPRESSUREPERPOINT_CD": "VARCHAR5",
+    "ISROGUEPROXY_CD": "VARCHAR10",
+    "GUID_NRO": "VARCHAR47",
+    "SESSIONSTORAGE_CD": "VARCHAR1",
+    "INDEXEDDB_NRO": "VARCHAR1",
+    "ORIGIN_NRO": "VARCHAR40",
+    "AUTH_2_CD": "VARCHAR25",
+    "AUTH_3_CD": "VARCHAR25",
+    "RESPONSE_AUTH_2_IND": "VARCHAR5",
+    "RESPONSE AUTH_3_IND": "VARCHAR5",  # NOTE: space is intentional
+    "ORIG_ACC_HOLDER_NAME": "VARCHAR40",
+    "SURNAME_ORIG_ACC_HOLDER": "VARCHAR40",
+    "DESTINATION_ENTITY_NAME": "VARCHAR80",
+    "RESULTING_REGISTRATION_CD": "VARCHAR5",
+    "LAST_CONNECTION_JUMP_DATE": "INTEGER8",
+    "CONS_MASIVIAN_HOUR": "INTEGER6",
+    "CONS_MASIVIAN_DATE": "INTEGER8",
+    "RESPONSE_MASIVIAN_HOUR": "INTEGER6",
+    "RESPONSE_MASIVIAN_DATE": "INTEGER8",
+    "CELLULAR_CONS_MASIVIAN_NRO": "VARCHAR15",
+    "CONFIRMED_OPER_MASIVIAN_NAME": "VARCHAR15",
+    "RESP_VALUE_SIM_CHANGE_CD": "VARCHAR1",
+    "SHERLOCK_MASIVIAN_ANOMALY_CD": "VARCHAR4",
+    "MISTRUST_SHERLOCK_MASIVIAN_CD": "VARCHAR4",
+    "SHERLOCK_MASIVIAN_PORTAB_CD": "VARCHAR1",
+    "OPERATOR_ANT_NAME": "VARCHAR15",
+    "SHERLOCK_MASSIVIAN_AGE_CD": "VARCHAR5",
+    "PAYMENT_REFE_NRO": "INTEGER30",
+    "PAYMENT_AGREEMENT_CD": "VARCHAR15",
+    "FAVOR_BRAND_REF_PAYMENT_CD": "VARCHAR1",
+    "REF_LAST_PAYMENT_HOUR": "INTEGER6",
+    "LAST_REF_PAYMENT_DATE": "INTEGER8",
+    "LAST_VALUE_PAYMENT_REF_NRO": "VARCHAR14",
+    "PAYMENT_MADE_REFE_CNT": "VARCHAR4",
+    "TIME_PAYMENT_NAME": "VARCHAR15",
+    "PAYMENT_LIMIT_ATM": "INTEGER14",
+    "PROG_DAYS_BEFORE_EXP_NO": "INTEGER2",
+    "LAST_UP_DATE": "INTEGER8",
+    "LAST_UP_HOUR": "INTEGER6",
+}
+
+ECM_FIELD_TYPES: Dict[str, str] = {
+    "RECEPTION_DATE": "INTEGER",
+    "RECEPTION_HOUR": "INTEGER",
+    "GENDER_ALERT_IND": "VARCHAR2(5)",
+    "INVESTIGATION_DATE": "INTEGER",
+    "RESEARCH_HOUR": "INTEGER",
+    "CLOSING_DATE": "VARCHAR2(19)",
+    "CLOSING_HOUR": "INTEGER",
+    "ALERT_CONDITIONS_TEXT": "VARCHAR2(1000)",
+    "RESULT_TYPE_CD": "VARCHAR2(50)",
+    "SUBTYPE_RESULT_CD": "VARCHAR2(50)",
+    "TRX_IND": "VARCHAR2(50)",
+    "CORRECTION_IND": "VARCHAR2(5)",
+    "CORRELATIVE_NO": "VARCHAR2(50)",
+    "SESSION_ID": "VARCHAR2(60)",
+    "TRX_DATE": "INTEGER",
+    "TRX_HOUR": "INTEGER",
+}
+
+
+# ---------------------------------------------------------------------------
+# 2. Random helpers
+# ---------------------------------------------------------------------------
+
+def random_date(start_year=2020, end_year=2024) -> datetime:
+    """Random datetime between Jan 1 of start_year and Dec 31 of end_year."""
+    start = datetime(start_year, 1, 1)
+    end = datetime(end_year, 12, 31)
+    delta_days = (end - start).days
+    return start + timedelta(days=random.randint(0, delta_days),
+                             seconds=random.randint(0, 24 * 3600 - 1))
+
+
+def date_to_int_yyyymmdd(dt: datetime) -> int:
+    return int(dt.strftime("%Y%m%d"))
+
+
+def date_to_str_yyyy_mm_dd(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d")
+
+
+def datetime_to_str(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def random_ip() -> str:
+    return ".".join(str(random.randint(1, 254)) for _ in range(4))
+
+
+def random_phone(length: int = 10) -> str:
+    return "".join(random.choice(string.digits) for _ in range(length))
+
+
+def random_email() -> str:
+    user = "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(8))
+    domain = random.choice(["gmail.com", "yahoo.com", "hotmail.com", "bank.com"])
+    return f"{user}@{domain}"
+
+
+def random_string(max_len: int) -> str:
+    """Generate a random string with length between 1 and max_len
+    (or 3 and max_len if max_len is large enough)."""
+    if max_len <= 0:
+        max_len = 1
+
+    # For very short fields (e.g. VARCHAR1, VARCHAR2), allow length 1..max_len.
+    # For normal fields, keep your old behaviour (3..max_len).
+    if max_len < 3:
+        min_len = 1
+    else:
+        min_len = 3
+
+    length = random.randint(min_len, max_len)
+    chars = string.ascii_letters + string.digits + " _-"
+    return "".join(random.choice(chars) for _ in range(length))
+
+
+def random_country_code() -> str:
+    return random.choice(["CO", "US", "MX", "BR", "AR", "ES"])
+
+
+def random_currency() -> str:
+    return random.choice(["COP", "USD", "EUR"])
+
+
+def random_gender_flag() -> str:
+    return random.choice(["M", "F", "U"])
+
+
+def random_yes_no_flag() -> str:
+    return random.choice(["Y", "N"])
+
+
+def random_language() -> str:
+    return random.choice(["es", "en", "pt", "fr"])
+
+
+def random_amount() -> float:
+    # Skewed distribution: many small, few large amounts
+    base = 10 ** random.uniform(1, 5)  # 10..100000
+    return round(base, 2)
+
+
+def random_exchange_rate() -> float:
+    return round(random.uniform(3000, 5000), 4)
+
+
+def random_int_by_digits(digits: int) -> int:
+    lo = 10 ** (digits - 1)
+    hi = 10 ** digits - 1
+    return random.randint(lo, hi)
+
+
+# ---------------------------------------------------------------------------
+# 3. Value generator per field/type
+# ---------------------------------------------------------------------------
+
+def generate_trx_value(field: str, type_label: str, is_fraud: bool, trx_index: int) -> Any:
+    tl = type_label.upper()
+
+    # Special cases / semantics first
+    if field == "RT_FRD_JUMP_KEY":
+        return trx_index + 1
+
+    if field == "FRAUD_IND":
+        # Represented as "1"/"0" in VARCHAR2(5)
+        return "1" if is_fraud else "0"
+
+    if field == "CORRELATIVE_NO":
+        # Use as transaction id / join key
+        return f"TRX-{trx_index+1:010d}"
+
+    if field == "SESSION_ID":
+        # Some transactions share sessions
+        session_base = trx_index // random.randint(5, 20)
+        return f"SESS-{session_base:08d}"
+
+    if field == "CURRENCY_CD":
+        return random_currency()
+
+    if field == "CONNECTION_IP_NO" or field == "LOCAL_IP_ADDRESS_NO":
+        return random_ip()
+
+    if "EMAIL" in field:
+        return random_email()
+
+    if "PHONE" in field or "TEL" in field:
+        # lengths vary; we'll just do up to 10-12 digits
+        return random_phone(length=10)
+
+    if field in {"TRX_TOTAL_AMT", "TRX_US_DOLLARS_AMT"}:
+        amt = random_amount()
+        if field == "TRX_US_DOLLARS_AMT":
+            # simple conversion
+            return round(amt / random.uniform(3800, 4200), 2)
+        return amt
+
+    if field == "EXCHANGE_RATE":
+        return random_exchange_rate()
+
+    if "COUNTRY" in field:
+        return random_country_code()
+
+    if "LANGUAGE" in field:
+        return random_language()
+
+    if field in {"GENDER_ALERT_IND", "GENDER"}:
+        return random_gender_flag()
+
+    # Date/time-ish fields treated specially
+    if "DATE" in field and "BIRTH_DATE" not in field and "UP_DATE" not in field:
+        dt = random_date()
+        if "INTEGER" in tl or tl.endswith("8") or tl.endswith("10"):
+            return date_to_int_yyyymmdd(dt)
+        else:
+            return datetime_to_str(dt)
+
+    if field in {"AUDIT_DT", "LAST_UPD_DT"}:
+        dt = random_date()
+        return date_to_str_yyyy_mm_dd(dt)
+
+    if "BIRTH_DATE" in field:
+        # Birth date ~ 18-80 years ago
+        now = datetime.now()
+        years_ago = random.randint(18, 80)
+        birth = now - timedelta(days=years_ago * 365)
+        if "INTEGER" in tl:
+            return int(birth.strftime("%Y%m%d"))
+        return date_to_str_yyyy_mm_dd(birth)
+
+    if "HOUR" in field:
+        # integer hours 0-23 or hhmmss style for INTEGER6
+        if tl.endswith("6"):
+            # hhmmss
+            hh = random.randint(0, 23)
+            mm = random.randint(0, 59)
+            ss = random.randint(0, 59)
+            return int(f"{hh:02d}{mm:02d}{ss:02d}")
+        else:
+            return random.randint(0, 23)
+
+    if field in {"TRANSACTION_DT", "LAST_UP_DATE", "LAST_CONNECTION_JUMP_DATE",
+                 "CONS_MASIVIAN_DATE", "RESPONSE_MASIVIAN_DATE",
+                 "LAST_REF_PAYMENT_DATE"}:
+        dt = random_date()
+        return int(dt.strftime("%Y%m%d"))
+
+    if field == "TRANSACTION_DT_TIME":
+        dt = random_date()
+        return datetime_to_str(dt)
+
+    # Now generic type-based behaviour
+    if "DECIMAL" in tl:
+        return random_amount() if "AMT" in field or "LIMIT" in field else round(random.uniform(0, 100000), 4)
+
+    if "INTEGER" in tl:
+        # handle various INTEGERX lengths
+        if tl.endswith("30"):
+            return random_int_by_digits(10)
+        if tl.endswith("14"):
+            return random_int_by_digits(9)
+        if tl.endswith("10"):
+            return random_int_by_digits(8)
+        if tl.endswith("8"):
+            return random_int_by_digits(8)
+        if tl.endswith("6"):
+            return random_int_by_digits(6)
+        if tl.endswith("2"):
+            return random_int_by_digits(2)
+        return random.randint(0, 999999)
+
+    # Char / varchar things
+    if "CHAR" in tl or "VARCHAR" in tl:
+        # Use some light domain-specific codes if obvious
+        if field.endswith("_CD") or field.endswith("_IND"):
+            return random.choice(["A", "B", "C", "D", "E", "Y", "N", "0", "1"])
+        max_len = 10
+        # extract length from VARCHARx if present
+        for tag in ["VARCHAR2(", "VARCHAR", "VARHCAR"]:
+            if tag in tl:
+                try:
+                    part = tl.split(tag, 1)[1]
+                    digits = ""
+                    for ch in part:
+                        if ch.isdigit():
+                            digits += ch
+                        else:
+                            break
+                    if digits:
+                        max_len = min(int(digits), 50)
+                except Exception:
+                    pass
+        return random_string(max_len)
+
+    if "DATE" in tl or "DATETIME" in tl:
+        dt = random_date()
+        return datetime_to_str(dt)
+
+    # Fallback
+    return random_string(20)
+
+
+def generate_ecm_value(field: str, type_label: str, trx_row: Dict[str, Any], is_fraud: bool) -> Any:
+    tl = type_label.upper()
+
+    # Link fields
+    if field == "CORRELATIVE_NO":
+        return trx_row["CORRELATIVE_NO"]
+    if field == "SESSION_ID":
+        # clip to ECM max length (60) just in case
+        return str(trx_row.get("SESSION_ID", ""))[:60]
+
+    # Mirror TRX date/hour when sensible
+    if field == "TRX_DATE":
+        return trx_row.get("TRX_DATE", date_to_int_yyyymmdd(random_date()))
+    if field == "TRX_HOUR":
+        return trx_row.get("TRX_HOUR", random.randint(0, 23))
+
+    # Investigation/closing times
+    if field in {"RECEPTION_DATE", "INVESTIGATION_DATE"}:
+        dt = random_date()
+        return date_to_int_yyyymmdd(dt)
+
+    if field in {"RECEPTION_HOUR", "RESEARCH_HOUR", "CLOSING_HOUR"}:
+        return random.randint(0, 23)
+
+    if field == "CLOSING_DATE":
+        dt = random_date()
+        return datetime_to_str(dt)
+
+    # Fraud-related-ish outcome codes (not labels, just outcome flavour)
+    if field == "RESULT_TYPE_CD":
+        return "CONFIRMED_FRAUD" if is_fraud else random.choice(["GENUINE", "DISCARDED", "FALSE_POSITIVE"])
+
+    if field == "SUBTYPE_RESULT_CD":
+        return random.choice(["RULE_ENGINE", "MANUAL_REVIEW", "CUSTOMER_CALLBACK", "OTHER"])
+
+    if field == "TRX_IND":
+        return "Y"
+
+    if field == "CORRECTION_IND":
+        return random_yes_no_flag()
+
+    if field == "GENDER_ALERT_IND":
+        return random_gender_flag()
+
+    if field == "ALERT_CONDITIONS_TEXT":
+        if is_fraud:
+            return "High-value international transfer with unusual device pattern"
+        else:
+            return "Standard rule-based alert; no anomaly confirmed"
+
+    # Types
+    if "INTEGER" in tl:
+        return random.randint(0, 999999)
+
+    if "VARCHAR" in tl or "CHAR" in tl:
+        max_len = 10
+        for tag in ["VARCHAR2(", "VARCHAR"]:
+            if tag in tl:
+                try:
+                    part = tl.split(tag, 1)[1]
+                    digits = ""
+                    for ch in part:
+                        if ch.isdigit():
+                            digits += ch
+                        else:
+                            break
+                    if digits:
+                        max_len = min(int(digits), 100)
+                except Exception:
+                    pass
+        return random_string(max_len)
+
+    if "DATE" in tl or "DATETIME" in tl:
+        dt = random_date()
+        return datetime_to_str(dt)
+
+    # Fallback
+    return random_string(20)
+
+
+# ---------------------------------------------------------------------------
+# 4. Main generation logic
+# ---------------------------------------------------------------------------
+
+def generate_datasets(
+    n_transactions: int,
+    fraud_ratio: float,
+    out_dir: Path,
+    seed: int = 42,
+) -> None:
+    random.seed(seed)
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    trx_path = out_dir / "transactions.jsonl"
+    ecm_path = out_dir / "ecm.jsonl"
+
+    # Decide fraud indices
+    n_fraud = int(round(n_transactions * fraud_ratio))
+    if n_fraud < 1:
+        n_fraud = 1  # ensure at least 1 fraud for tests
+    fraud_indices = set(random.sample(range(n_transactions), n_fraud))
+
+    print(f"[INFO] Generating {n_transactions} transactions...")
+    print(f"[INFO] Target fraud ratio={fraud_ratio:.8f} -> {n_fraud} fraud rows")
+
+    trx_fields: List[str] = list(TRX_FIELD_TYPES.keys())
+    ecm_fields: List[str] = list(ECM_FIELD_TYPES.keys())
+
+    with trx_path.open("w", encoding="utf-8") as f_trx, ecm_path.open("w", encoding="utf-8") as f_ecm:
+        for i in range(n_transactions):
+            is_fraud = i in fraud_indices
+
+            # Build TRX row
+            trx_row: Dict[str, Any] = {}
+            for field in trx_fields:
+                type_label = TRX_FIELD_TYPES[field]
+                trx_row[field] = generate_trx_value(field, type_label, is_fraud, i)
+
+            # Build ECM row (1:1 for now)
+            ecm_row: Dict[str, Any] = {}
+            for field in ecm_fields:
+                type_label = ECM_FIELD_TYPES[field]
+                ecm_row[field] = generate_ecm_value(field, type_label, trx_row, is_fraud)
+
+            # Write as JSON lines
+            f_trx.write(json.dumps(trx_row, ensure_ascii=False) + "\n")
+            f_ecm.write(json.dumps(ecm_row, ensure_ascii=False) + "\n")
+
+    print(f"[INFO] Wrote transactions to: {trx_path}")
+    print(f"[INFO] Wrote ECM records to:  {ecm_path}")
+
+
+# ---------------------------------------------------------------------------
+# 5. CLI
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Generate JSONL sample data for T_RT_FRD_JUMP_TRX and T_RT_FRD_JUMP_ECM_TRX"
+    )
+    parser.add_argument(
+        "--n-transactions",
+        type=int,
+        default=200000,
+        help="Number of transactions to generate (default: 200000)",
+    )
+    parser.add_argument(
+        "--fraud-ratio",
+        type=float,
+        default=0.000037,  # ~0.0037%
+        help="Fraud ratio as a fraction (e.g., 0.000037 ≈ 0.0037%%)",
+    )
+    parser.add_argument(
+        "--out-dir",
+        type=str,
+        default="./local_data/sample",
+        help="Output directory for transactions.jsonl and ecm.jsonl",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducibility",
+    )
+
+    args = parser.parse_args()
+
+    out_dir = Path(args.out_dir)
+    generate_datasets(
+        n_transactions=args.n_transactions,
+        fraud_ratio=args.fraud_ratio,
+        out_dir=out_dir,
+        seed=args.seed,
+    )
+
+
+if __name__ == "__main__":
+    main()

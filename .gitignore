@@ -3,4 +3,4 @@ __pycache__/
 local_data/*.parquet
 .DS_Store
 local_data/.DS_Store
-local_data/sample
+local_data/sample/*.jsonl

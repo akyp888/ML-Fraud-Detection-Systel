@@ -1,159 +1,119 @@
 #!/usr/bin/env python3
 """
-TechM Fraud Detection Pipeline - God Tier Local Version
-=======================================================
+Hybrid Resampling + Multi-Model Fraud Detection Pipeline
+========================================================
 
-This script is a refactored, overfitting-resistant, feature-rich local pipeline
-for fraud detection. It is designed to:
+Assumptions:
+  - Input file: transactions.jsonl with schema based on T_RT_FRD_JUMP_TRX.
+  - Label column: FRAUD_IND (string/number: "1" = fraud, else non-fraud).
+  - Extreme imbalance (e.g., ~0.0037% fraud).
 
-- Load sample JSONL data (transactions + ECM) from local_data/
-- Intentionally "mess up" the data to simulate noisy, real-world conditions
-- Merge transactions with ECM outcomes and create a clean binary label
-- Engineer strong transactional + entity / graph-like features
-- Handle extreme class imbalance with advanced resampling (SMOTE-Tomek + BorderlineSMOTE)
-- Train multiple tree-based models with regularization:
-    - RandomForest (scikit-learn)
-    - LightGBM (optional, if installed)
-    - XGBoost (optional, if installed)
-- Tune probability thresholds based on validation F1/F2 and Precision-Recall
-- Evaluate on a held-out test set, including precision@K
+Pipeline:
+  1. Load JSONL and create binary label column.
+  2. Stratified train / validation / test split.
+  3. Preprocessing:
+       - Numeric: median imputation + StandardScaler.
+       - Categorical: most_frequent imputation + OneHotEncoder.
+  4. Hybrid resampling on TRAIN ONLY:
+       - SMOTETomek (SMOTE + Tomek Links).
+       - SMOTEENN  (SMOTE + Edited Nearest Neighbors).
+       - Each with configurable oversampling factor.
+  5. Train models on resampled data:
+       - RandomForestClassifier
+       - LGBMClassifier (LightGBM)
+       - XGBClassifier  (XGBoost)
+  6. Evaluate:
+       - ROC-AUC, PR-AUC (Average Precision).
+       - Threshold tuned by F_beta on validation.
+       - Classification report on val & test.
+       - Precision@top-K (top fraction of highest scores).
 
-It is intentionally "god tier": heavily instrumented, modular, and robust against
-messy data. You can later adapt the same ideas to Spark / cluster scale.
-
-Requirements (recommended):
-    pip install pandas numpy scikit-learn imbalanced-learn lightgbm xgboost
-
-Usage:
-    python techm_local_pipeline.py
+Note: This script focuses on the *tabular ML / resampling* side and assumes
+the data schema is already correct as per your data dictionary. It only
+relies on the presence of FRAUD_IND and treats all other columns as features.
 """
 
-import os
-import sys
+import argparse
 import json
 import math
-import logging
 import random
-import inspect
-import time
+import sys
+from collections import Counter
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import List, Tuple, Dict, Optional, Any
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 
-from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.impute import SimpleImputer
 from sklearn.metrics import (
-    roc_auc_score,
     average_precision_score,
+    classification_report,
     f1_score,
     precision_recall_curve,
-    classification_report,
+    roc_auc_score,
 )
-from sklearn.compose import ColumnTransformer
+from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
-from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.utils.class_weight import compute_class_weight
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-# Optional dependencies --------------------------------------------------------
-try:
-    import lightgbm as lgb  # full package, for callbacks
-    from lightgbm import LGBMClassifier  # type: ignore
-except Exception:
-    lgb = None
-    LGBMClassifier = None
+from imblearn.combine import SMOTETomek, SMOTEENN
+from imblearn.over_sampling import SMOTE
 
-try:
-    from xgboost import XGBClassifier  # type: ignore
-except Exception:
-    XGBClassifier = None
-
-try:
-    from imblearn.combine import SMOTETomek  # type: ignore
-    from imblearn.over_sampling import BorderlineSMOTE, SMOTE  # type: ignore
-    from imblearn.under_sampling import TomekLinks  # type: ignore
-except Exception:
-    SMOTETomek = None
-    BorderlineSMOTE = None
-    SMOTE = None
-    TomekLinks = None
-
-# ------------------------------------------------------------------------------
-# Logging configuration
-# ------------------------------------------------------------------------------
-
-logger = logging.getLogger("techm-fraud-god-tier")
-logger.setLevel(logging.INFO)
-_handler = logging.StreamHandler(sys.stdout)
-_handler.setFormatter(
-    logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
-)
-logger.addHandler(_handler)
+import lightgbm as lgb
+from lightgbm import LGBMClassifier
+from xgboost import XGBClassifier
 
 
-# ------------------------------------------------------------------------------
-# Config dataclass
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Logging helper
+# ---------------------------------------------------------------------------
+
+def log(msg: str) -> None:
+    print(msg, file=sys.stdout, flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
 @dataclass
 class Config:
-    base_dir: Path = Path(__file__).resolve().parent
-    data_dir: Path = Path(__file__).resolve().parent / "local_data" / "sample"
-    sample_dir: Path = Path(__file__).resolve().parent / "local_data" / "sample"
-    transactions_jsonl: str = "transactions.jsonl"
-    ecm_jsonl: str = "ecm.jsonl"
-
-    # Columns
+    transactions_path: Path
     label_col: str = "label"
-    ecm_label_col: str = "FRAUD_STATE"   # column in ECM table to derive label from
-    trx_id_col: str = "CORRELATIVE_NO"
-    customer_col: str = "CUSTOMER_NO"
-    account_col: str = "ACCOUNT_NO"
-    dest_account_col: str = "DESTINATION_ACCOUNT_NO"
-    device_col: str = "DEVICE_HASH_NO"
-    ip_col: str = "CONNECTION_IP_NO"
-    phone_col: str = "PHONE_CELL_NO"
-    email_col: str = "EMAIL_LINE"
-    trx_amount_col: str = "TRX_TOTAL_AMT"
-    trx_date_col: str = "TRX_DATE"
-    trx_hour_col: str = "TRX_HOUR"
-
-    # Train/val/test split
+    raw_label_col: str = "FRAUD_IND"
     random_state: int = 42
-    val_size: float = 0.15
-    test_size: float = 0.15
 
-    # Threshold tuning
-    f_beta: float = 1.0          # F1; can set to >1 for recall-heavy F2
-    top_k_frac: float = 0.01     # precision@top 1% of scores
+    # Splits
+    test_size: float = 0.2
+    val_size: float = 0.1  # relative to full dataset
 
-    # Imbalance handling
-    use_smote_tomek: bool = True
-    smote_kind: str = "borderline"  # or "regular"
+    # Resampling
+    smotetomek_factor: float = 10.0   # oversample factor for SMOTETomek
+    smoteenn_factor: float = 10.0     # oversample factor for SMOTEENN
 
-    # RandomForest hyperparams (for warm_start training)
-    rf_n_estimators: int = 200
-    rf_warm_start_chunk: int = 50
-    rf_n_jobs: int = -1
-
-    # Misc
+    # Evaluation
+    f_beta: float = 1.0               # F1 by default; >1 favors recall
+    top_k_frac: float = 0.01          # Precision@top 1% of scores
     verbose_reports: bool = True
 
+    # Which strategies/models to run
+    resamplers: Tuple[str, ...] = ("smotetomek", "smoteenn")
+    models: Tuple[str, ...] = ("rf", "lgbm", "xgb")
 
-# ------------------------------------------------------------------------------
-# Utility functions
-# ------------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
 
 def seed_everything(seed: int = 42) -> None:
-    """Seed all known random generators for reproducibility."""
     random.seed(seed)
     np.random.seed(seed)
     try:
         import torch  # type: ignore
-
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
@@ -161,523 +121,121 @@ def seed_everything(seed: int = 42) -> None:
         pass
 
 
-def safe_parse_date(series: pd.Series) -> pd.Series:
-    """Best-effort parse of a date-like series to datetime.date."""
-    parsed = pd.to_datetime(series, errors="coerce")
-    return parsed.dt.date
+# ---------------------------------------------------------------------------
+# Data loading & splitting
+# ---------------------------------------------------------------------------
 
+def load_transactions(cfg: Config) -> pd.DataFrame:
+    log(f"[INFO] Loading transactions from {cfg.transactions_path}")
+    df = pd.read_json(cfg.transactions_path, lines=True)
 
-def safe_parse_int(series: pd.Series) -> pd.Series:
-    """Coerce to numeric integers; invalid -> NaN."""
-    return pd.to_numeric(series, errors="coerce").astype("Int64")
-
-
-def safe_parse_float(series: pd.Series) -> pd.Series:
-    """Coerce to floats; invalid -> NaN."""
-    return pd.to_numeric(series, errors="coerce").astype("float64")
-
-
-def make_data_messy(
-    df_trx: pd.DataFrame,
-    df_ecm: pd.DataFrame,
-    cfg: Config,
-    rng: np.random.RandomState,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Intentionally inject noise and messiness into the data to stress-test the pipeline.
-
-    - Randomly drop some values to create missingness
-    - Perturb transaction amounts
-    - Mutate category strings (new/unknown categories, random casing)
-    - Duplicate a few rows to simulate duplicates
-    """
-
-    df_trx = df_trx.copy()
-    df_ecm = df_ecm.copy()
-
-    # 1. Randomly create missing values in some columns
-    noisy_cols = [
-        cfg.trx_amount_col,
-        cfg.trx_date_col,
-        cfg.trx_hour_col,
-        cfg.device_col,
-        cfg.ip_col,
-        cfg.phone_col,
-        cfg.email_col,
-    ]
-    for col in noisy_cols:
-        if col in df_trx.columns:
-            mask = rng.rand(len(df_trx)) < 0.03  # 3% missing
-            df_trx.loc[mask, col] = np.nan
-
-    # 2. Perturb transaction amounts
-    if cfg.trx_amount_col in df_trx.columns:
-        amt = df_trx[cfg.trx_amount_col].copy()
-        amt = pd.to_numeric(amt, errors="coerce")
-        noise_mask = rng.rand(len(amt)) < 0.15  # 15% rows get noisy
-        noise_factor = rng.lognormal(mean=0.0, sigma=0.75, size=noise_mask.sum())
-        amt.loc[noise_mask] = amt.loc[noise_mask] * noise_factor
-        df_trx[cfg.trx_amount_col] = amt
-
-    # 3. Create new weird categories in some character columns
-    cat_cols = [
-        cfg.device_col,
-        cfg.ip_col,
-        cfg.phone_col,
-        cfg.email_col,
-        "TRX_ORIGIN_CD",
-        "CURRENCY_CD",
-    ]
-    for col in cat_cols:
-        if col in df_trx.columns:
-            weird_mask = rng.rand(len(df_trx)) < 0.02  # 2%
-            df_trx.loc[weird_mask, col] = "ZZZ_UNKNOWN_" + col
-
-    # 4. Mutate FRAUD_STATE strings (mixed case, synonyms)
-    if cfg.ecm_label_col in df_ecm.columns:
-        ecm = df_ecm[cfg.ecm_label_col].astype(str)
-        # introduce some noise
-        variants = {
-            "FRAUD": ["FRAUD", "fraud", "Fraud", "FRAUDULENT"],
-            "GENUINE": ["GENUINE", "genuine", "Genuine", "LEGIT"],
-        }
-
-        def randomize_state(s: str) -> str:
-            s_up = s.strip().upper()
-            if "FRAUD" in s_up:
-                return rng.choice(variants["FRAUD"])
-            elif "GENUINE" in s_up or "LEGIT" in s_up:
-                return rng.choice(variants["GENUINE"])
-            else:
-                # occasionally flip or make it weird
-                if rng.rand() < 0.5:
-                    return rng.choice(variants["FRAUD"] + variants["GENUINE"])
-                return s
-
-        df_ecm[cfg.ecm_label_col] = ecm.apply(randomize_state)
-
-    # 5. Duplicate a small % of transactions to simulate duplicates
-    if len(df_trx) > 0:
-        dup_mask = rng.rand(len(df_trx)) < 0.01  # 1%
-        dup_rows = df_trx[dup_mask]
-        if not dup_rows.empty:
-            df_trx = pd.concat([df_trx, dup_rows], ignore_index=True)
-
-    return df_trx, df_ecm
-
-
-# ------------------------------------------------------------------------------
-# Data loading and merging
-# ------------------------------------------------------------------------------
-
-def load_sample_jsonl(cfg: Config) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Load transactions.jsonl and ecm.jsonl from cfg.sample_dir.
-    """
-    trx_path = cfg.sample_dir / cfg.transactions_jsonl
-    ecm_path = cfg.sample_dir / cfg.ecm_jsonl
-
-    if not trx_path.exists() or not ecm_path.exists():
-        raise FileNotFoundError(
-            f"Sample JSONL files not found in {cfg.sample_dir}. "
-            f"Expected {cfg.transactions_jsonl} and {cfg.ecm_jsonl}"
+    if cfg.raw_label_col not in df.columns:
+        raise KeyError(
+            f"Expected label column '{cfg.raw_label_col}' in transactions file."
         )
 
-    logger.info(f"Reading transactions JSONL: {trx_path}")
-    df_trx = pd.read_json(trx_path, lines=True)
-
-    logger.info(f"Reading ECM JSONL: {ecm_path}")
-    df_ecm = pd.read_json(ecm_path, lines=True)
-
-    return df_trx, df_ecm
-
-
-def clean_and_normalize_raw(
-    df_trx: pd.DataFrame,
-    df_ecm: pd.DataFrame,
-    cfg: Config,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Perform basic type cleaning and normalization on raw JSONL-loaded data.
-
-    - Parse dates/hours where present
-    - Ensure IDs are treated consistently as strings
-    """
-    df_trx = df_trx.copy()
-    df_ecm = df_ecm.copy()
-
-    # Normalize transaction date/hour
-    if cfg.trx_date_col in df_trx.columns:
-        df_trx[cfg.trx_date_col] = safe_parse_date(df_trx[cfg.trx_date_col])
-    if cfg.trx_hour_col in df_trx.columns:
-        df_trx[cfg.trx_hour_col] = safe_parse_int(df_trx[cfg.trx_hour_col])
-
-    # Normalize amount
-    if cfg.trx_amount_col in df_trx.columns:
-        df_trx[cfg.trx_amount_col] = safe_parse_float(df_trx[cfg.trx_amount_col])
-
-    # Normalize ECM closing date/hour if present (not strictly needed here)
-    if "CLOSING_DATE" in df_ecm.columns:
-        df_ecm["CLOSING_DATE"] = safe_parse_date(df_ecm["CLOSING_DATE"])
-    if "CLOSING_HOUR" in df_ecm.columns:
-        df_ecm["CLOSING_HOUR"] = safe_parse_int(df_ecm["CLOSING_HOUR"])
-
-    # Ensure key IDs are strings (avoid mixing numeric/object)
-    id_cols = [
-        cfg.trx_id_col,
-        cfg.customer_col,
-        cfg.account_col,
-        cfg.dest_account_col,
-        cfg.device_col,
-        cfg.ip_col,
-        cfg.phone_col,
-        cfg.email_col,
-    ]
-    for col in id_cols:
-        for df in (df_trx, df_ecm):
-            if col in df.columns:
-                df[col] = df[col].astype(str)
-
-    return df_trx, df_ecm
-
-
-def merge_trx_and_ecm(
-    df_trx: pd.DataFrame,
-    df_ecm: pd.DataFrame,
-    cfg: Config,
-) -> pd.DataFrame:
-    """
-    Merge transaction and ECM datasets, deduplicate, and create binary label.
-
-    - Left-join on CORRELATIVE_NO (or cfg.trx_id_col)
-    - Derive label from cfg.ecm_label_col in ECM
-    - Drop ECM columns that could leak investigation outcomes
-    """
-    df_trx = df_trx.copy()
-    df_ecm = df_ecm.copy()
-
-    if cfg.trx_id_col not in df_trx.columns:
-        raise KeyError(f"Transaction ID column {cfg.trx_id_col} not found in trx data")
-    if cfg.trx_id_col not in df_ecm.columns:
-        raise KeyError(f"Transaction ID column {cfg.trx_id_col} not found in ECM data")
-
-    # Deduplicate: keep latest ECM per transaction if closing date/hour present
-    if "CLOSING_DATE" in df_ecm.columns:
-        df_ecm = df_ecm.sort_values(["CORRELATIVE_NO", "CLOSING_DATE"]).drop_duplicates(
-            subset=[cfg.trx_id_col], keep="last"
-        )
-    else:
-        df_ecm = df_ecm.drop_duplicates(subset=[cfg.trx_id_col], keep="last")
-
-    # Merge
-    merged = df_trx.merge(df_ecm, on=cfg.trx_id_col, how="left", suffixes=("", "_ECM"))
-    logger.info(f"Merged shape: {merged.shape[0]} rows, {merged.shape[1]} columns")
-
-    # Create label
-    if cfg.ecm_label_col not in merged.columns:
-        raise KeyError(f"ECM label column {cfg.ecm_label_col} not found in merged data")
-
-    label_series = merged[cfg.ecm_label_col].astype(str).str.upper().str.strip()
-    is_fraud = label_series.str.contains("FRAUD")
-    # treat unknown as non-fraud by default
-    merged[cfg.label_col] = np.where(is_fraud, 1, 0)
-
-    logger.info(
-        f"Label distribution after merge: "
-        f"non-fraud={int((merged[cfg.label_col] == 0).sum())}, "
-        f"fraud={int((merged[cfg.label_col] == 1).sum())}"
+    # Normalize FRAUD_IND -> 0/1
+    df[cfg.label_col] = (
+        df[cfg.raw_label_col].astype(str).str.strip().eq("1").astype(int)
     )
 
-    # Drop outcome/ECM fields that would leak the label
-    leak_cols = [
-        cfg.ecm_label_col,
-        "RESULT_TYPE_CD",
-        "SUBTYPE_RESULT_CD",
-        "ANALYST_ID",
-        "CASE_STATUS_CD",
-        "CLOSING_DATE",
-        "CLOSING_HOUR",
-    ]
-    leak_cols_present = [c for c in leak_cols if c in merged.columns]
-    merged = merged.drop(columns=leak_cols_present, errors="ignore")
-
-    # Drop exact duplicates after merge
-    merged = merged.drop_duplicates(subset=[cfg.trx_id_col], keep="last")
-
-    return merged
+    log(
+        f"[INFO] Loaded {len(df)} rows; "
+        f"fraud count={int(df[cfg.label_col].sum())}"
+    )
+    return df
 
 
-# ------------------------------------------------------------------------------
-# Train / Validation / Test splitting
-# ------------------------------------------------------------------------------
-
-def split_train_val_test(
+def stratified_split(
     df: pd.DataFrame,
     cfg: Config,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Split into train/val/test.
-
-    Prefer temporal split if transaction date is available; otherwise stratified random.
+    Stratified train/val/test split on the label column.
     """
-    df = df.copy()
     y = df[cfg.label_col].values
 
-    if cfg.trx_date_col in df.columns:
-        logger.info("Using temporal split by TRX_DATE")
-        df = df.sort_values(cfg.trx_date_col)
-        # simple temporal: oldest 70%, next 15%, newest 15%
-        n = len(df)
-        n_train = int((1.0 - cfg.val_size - cfg.test_size) * n)
-        n_val = int(cfg.val_size * n)
-        train = df.iloc[:n_train]
-        val = df.iloc[n_train : n_train + n_val]
-        test = df.iloc[n_train + n_val :]
-    else:
-        logger.info("Using stratified random split (no TRX_DATE available)")
-        train_val, test = train_test_split(
-            df,
-            test_size=cfg.test_size,
-            stratify=y,
-            random_state=cfg.random_state,
-        )
-        y_train_val = train_val[cfg.label_col].values
-        train, val = train_test_split(
-            train_val,
-            test_size=cfg.val_size / (1.0 - cfg.test_size),
-            stratify=y_train_val,
-            random_state=cfg.random_state,
-        )
-
-    logger.info(
-        f"Split sizes: train={len(train)}, val={len(val)}, test={len(test)} "
-        f"(fraud in train={int(train[cfg.label_col].sum())}, "
-        f"fraud in val={int(val[cfg.label_col].sum())}, "
-        f"fraud in test={int(test[cfg.label_col].sum())})"
+    # 1) Train+Val vs Test
+    train_val_df, test_df = train_test_split(
+        df,
+        test_size=cfg.test_size,
+        stratify=y,
+        random_state=cfg.random_state,
     )
 
-    return train.reset_index(drop=True), val.reset_index(drop=True), test.reset_index(drop=True)
+    # 2) Train vs Val (relative)
+    y_train_val = train_val_df[cfg.label_col].values
+    val_rel = cfg.val_size / (1.0 - cfg.test_size)
+
+    train_df, val_df = train_test_split(
+        train_val_df,
+        test_size=val_rel,
+        stratify=y_train_val,
+        random_state=cfg.random_state,
+    )
+
+    log(
+        "[INFO] Split label=1 counts: "
+        f"train={int(train_df[cfg.label_col].sum())}/{len(train_df)}, "
+        f"val={int(val_df[cfg.label_col].sum())}/{len(val_df)}, "
+        f"test={int(test_df[cfg.label_col].sum())}/{len(test_df)}"
+    )
+
+    return train_df.reset_index(drop=True), val_df.reset_index(drop=True), test_df.reset_index(drop=True)
 
 
-# ------------------------------------------------------------------------------
-# Feature engineering: time, entity/graph-like, etc.
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Preprocessing (numeric + categorical)
+# ---------------------------------------------------------------------------
 
-def add_time_features(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    """Add simple time-based features if date/hour columns are present."""
-    df = df.copy()
-
-    if cfg.trx_date_col in df.columns:
-        date_parsed = pd.to_datetime(df[cfg.trx_date_col], errors="coerce")
-        df["TRX_DAYOFWEEK"] = date_parsed.dt.dayofweek
-        df["TRX_DAY"] = date_parsed.dt.day
-        df["TRX_MONTH"] = date_parsed.dt.month
-    if cfg.trx_hour_col in df.columns:
-        hour = pd.to_numeric(df[cfg.trx_hour_col], errors="coerce")
-        df["TRX_HOUR_CLEAN"] = hour
-        night_mask = (hour >= 0) & (hour <= 6)
-        df["TRX_IS_NIGHT"] = night_mask.fillna(False).astype(int)
-        df["TRX_IS_WEEKEND"] = 0
-        if "TRX_DAYOFWEEK" in df.columns:
-            weekend_mask = df["TRX_DAYOFWEEK"].isin([5, 6])
-            df["TRX_IS_WEEKEND"] = weekend_mask.fillna(False).astype(int)
-
-    if cfg.trx_amount_col in df.columns:
-        amount = pd.to_numeric(df[cfg.trx_amount_col], errors="coerce")
-        df["TRX_AMOUNT_LOG"] = np.log1p(amount.clip(lower=0))
-
-    return df
-
-
-def compute_entity_frequencies(
+def build_preprocessor(
     df: pd.DataFrame,
-    columns: List[str],
-) -> pd.DataFrame:
-    """
-    For each specified column, compute a simple frequency count and add as new feature.
-    """
-    df = df.copy()
-
-    for col in columns:
-        if col not in df.columns:
-            continue
-        freq = df[col].value_counts(dropna=False)
-        freq_map = freq.to_dict()
-        df[f"{col}_FREQ"] = df[col].map(freq_map).astype("float32")
-
-    return df
-
-
-def compute_entity_fraud_stats(
-    train: pd.DataFrame,
     cfg: Config,
-    entity_cols: List[str],
-) -> Dict[str, pd.DataFrame]:
+) -> Tuple[ColumnTransformer, List[str]]:
     """
-    For each entity column, compute fraud counts and rates from *training data only*.
+    Detect numeric vs categorical columns, build ColumnTransformer:
 
-    Returns a dict mapping entity column name -> stats dataframe with:
-        [entity_col, entity_col + "_FRAUD_COUNT", "_TOTAL_COUNT", "_FRAUD_RATE"]
+      - Numeric: median imputation + StandardScaler
+      - Categorical: most_frequent imputation + OneHotEncoder(handle_unknown='ignore')
     """
-    stats_dict: Dict[str, pd.DataFrame] = {}
-    _ = train[cfg.label_col].astype(int)
+    exclude_cols = {cfg.label_col, cfg.raw_label_col}
 
-    for col in entity_cols:
-        if col not in train.columns:
-            continue
-        grouped = train.groupby(col)[cfg.label_col].agg(["sum", "count"]).reset_index()
-        grouped.columns = [col, "FRAUD_COUNT", "TOTAL_COUNT"]
-        grouped["FRAUD_RATE"] = grouped["FRAUD_COUNT"] / grouped["TOTAL_COUNT"].clip(lower=1)
-        grouped.rename(
-            columns={
-                "FRAUD_COUNT": f"{col}_FRAUD_COUNT",
-                "TOTAL_COUNT": f"{col}_TOTAL_COUNT",
-                "FRAUD_RATE": f"{col}_FRAUD_RATE",
-            },
-            inplace=True,
-        )
-        stats_dict[col] = grouped
+    feature_cols = [c for c in df.columns if c not in exclude_cols]
 
-    return stats_dict
-
-
-def apply_entity_fraud_stats(
-    df: pd.DataFrame,
-    stats_dict: Dict[str, pd.DataFrame],
-) -> pd.DataFrame:
-    """Attach precomputed fraud stats to df for each entity column."""
-    df = df.copy()
-    for col, stats in stats_dict.items():
-        if col not in df.columns:
-            continue
-        df = df.merge(stats, on=col, how="left")
-        for suffix in ["_FRAUD_COUNT", "_TOTAL_COUNT", "_FRAUD_RATE"]:
-            stat_col = col + suffix
-            if stat_col in df.columns:
-                df[stat_col] = df[stat_col].fillna(0.0)
-    return df
-
-
-def engineer_features(
-    train: pd.DataFrame,
-    val: pd.DataFrame,
-    test: pd.DataFrame,
-    cfg: Config,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    Perform full feature engineering pipeline on train/val/test:
-
-    - Time / amount features
-    - Global entity frequencies
-    - Entity fraud stats based on training data only
-    """
-    logger.info("[STEP] Feature engineering (time + entity/graph-like features)")
-
-    # Basic time & amount features
-    train_fe = add_time_features(train, cfg)
-    val_fe = add_time_features(val, cfg)
-    test_fe = add_time_features(test, cfg)
-
-    # Entity frequency features
-    entity_cols = [
-        cfg.customer_col,
-        cfg.account_col,
-        cfg.dest_account_col,
-        cfg.device_col,
-        cfg.ip_col,
-        cfg.phone_col,
-        cfg.email_col,
-    ]
-    train_fe = compute_entity_frequencies(train_fe, entity_cols)
-    val_fe = compute_entity_frequencies(val_fe, entity_cols)
-    test_fe = compute_entity_frequencies(test_fe, entity_cols)
-
-    # Entity fraud stats (train only -> then merged into val/test)
-    stats_dict = compute_entity_fraud_stats(train_fe, cfg, entity_cols)
-    train_fe = apply_entity_fraud_stats(train_fe, stats_dict)
-    val_fe = apply_entity_fraud_stats(val_fe, stats_dict)
-    test_fe = apply_entity_fraud_stats(test_fe, stats_dict)
-
-    return train_fe, val_fe, test_fe
-
-
-# ------------------------------------------------------------------------------
-# Preprocessing & feature matrix construction
-# ------------------------------------------------------------------------------
-
-def build_feature_matrix(
-    train_fe: pd.DataFrame,
-    val_fe: pd.DataFrame,
-    test_fe: pd.DataFrame,
-    cfg: Config,
-) -> Tuple[Any, np.ndarray, Any, np.ndarray, Any, np.ndarray, Pipeline]:
-    """
-    Build X/y for train/val/test using a scikit-learn ColumnTransformer pipeline.
-
-    - Automatically detects numeric vs categorical columns
-    - Imputes missing values
-    - One-hot encodes categoricals (with handle_unknown='ignore')
-    - Leaves some high-cardinality ID columns out of OHE (they are represented by numeric freq/fraud stats)
-    """
-    logger.info("[STEP] Preparing ML feature matrix and preprocessing pipeline")
-
-    # Columns to exclude completely from features
-    exclude_cols = {
-        cfg.label_col,
-        cfg.trx_id_col,
-    }
-
-    # Identify candidate feature columns
-    all_cols = list(train_fe.columns)
-    feature_cols = [c for c in all_cols if c not in exclude_cols]
-
-    # Identify numeric vs categorical
     numeric_cols: List[str] = []
     categorical_cols: List[str] = []
     for col in feature_cols:
-        if pd.api.types.is_numeric_dtype(train_fe[col]):
+        if pd.api.types.is_numeric_dtype(df[col]):
             numeric_cols.append(col)
         else:
             categorical_cols.append(col)
 
-    # Remove obviously high-cardinality ID-like columns from categorical OHE,
-    # relying instead on numeric stats we created for them.
-    high_card_id_cols = [
-        cfg.customer_col,
-        cfg.account_col,
-        cfg.dest_account_col,
-        cfg.device_col,
-        cfg.ip_col,
-        cfg.phone_col,
-        cfg.email_col,
-    ]
-    categorical_cols = [c for c in categorical_cols if c not in high_card_id_cols]
-
-    logger.info(f"  Numeric feature columns: {len(numeric_cols)}")
-    logger.info(f"  Categorical feature columns (OHE): {len(categorical_cols)}")
+    log(f"[INFO] # numeric features    : {len(numeric_cols)}")
+    log(f"[INFO] # categorical features: {len(categorical_cols)}")
 
     numeric_transformer = Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
         ]
     )
 
-    ohe_kwargs = {"handle_unknown": "ignore"}
-    ohe_params = inspect.signature(OneHotEncoder.__init__).parameters
-    if "min_frequency" in ohe_params:
+    # Configure OneHotEncoder with dense output and min_frequency if available
+    ohe_kwargs: Dict[str, Any] = {"handle_unknown": "ignore"}
+    from inspect import signature
+    sig = signature(OneHotEncoder.__init__).parameters
+    if "min_frequency" in sig:
+        # avoid exploding dimension with ultra-rare categories
         ohe_kwargs["min_frequency"] = 10
-    if "sparse_output" in ohe_params:
+    if "sparse_output" in sig:
         ohe_kwargs["sparse_output"] = False
-    elif "sparse" in ohe_params:
+    elif "sparse" in sig:
         ohe_kwargs["sparse"] = False
 
     categorical_transformer = Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="most_frequent")),
-            (
-                "ohe",
-                OneHotEncoder(**ohe_kwargs),
-            ),
+            ("ohe", OneHotEncoder(**ohe_kwargs)),
         ]
     )
 
@@ -688,149 +246,122 @@ def build_feature_matrix(
         ]
     )
 
-    model_pipeline = Pipeline(
-        steps=[
-            ("preprocessor", preprocessor),
-        ]
+    return preprocessor, feature_cols
+
+
+# ---------------------------------------------------------------------------
+# Hybrid resampling builders
+# ---------------------------------------------------------------------------
+
+def build_smote_base(
+    y_train: np.ndarray,
+    oversample_factor: float,
+    random_state: int,
+) -> SMOTE:
+    """
+    Construct a SMOTE object with a custom sampling_strategy based on
+    an oversampling factor:
+
+      - Let n_min = minority count, n_maj = majority count.
+      - Target minority count n_min_target = min(n_maj, n_min * oversample_factor).
+      - sampling_strategy = n_min_target / n_maj
+
+    This allows you to oversample *partially* instead of fully balancing.
+    """
+    counter = Counter(y_train)
+    n_min = int(counter[1])
+    n_maj = int(counter[0])
+
+    if n_min == 0:
+        raise ValueError("No minority (fraud) samples in y_train; cannot apply SMOTE.")
+
+    n_min_target = int(min(n_maj, n_min * oversample_factor))
+    sampling_strategy = n_min_target / n_maj
+
+    log(f"[INFO] Original train class counts: {counter}")
+    log(
+        f"[INFO] SMOTE target minority count={n_min_target} "
+        f"(factor={oversample_factor}), sampling_strategy={sampling_strategy:.6f}"
     )
 
-    # Build full X/y sets
-    X_train = train_fe[feature_cols]
-    y_train = train_fe[cfg.label_col].values.astype(int)
+    k_neighbors = min(5, max(1, n_min - 1))  # guard for tiny minority
 
-    X_val = val_fe[feature_cols]
-    y_val = val_fe[cfg.label_col].values.astype(int)
-
-    X_test = test_fe[feature_cols]
-    y_test = test_fe[cfg.label_col].values.astype(int)
-
-    logger.info("Fitting preprocessing pipeline on train data...")
-    model_pipeline.fit(X_train)
-
-    logger.info("Transforming train/val/test with preprocessing pipeline...")
-    X_train_t = model_pipeline.transform(X_train)
-    X_val_t = model_pipeline.transform(X_val)
-    X_test_t = model_pipeline.transform(X_test)
-
-    logger.info(
-        f"Feature matrix shapes: X_train={X_train_t.shape}, "
-        f"X_val={X_val_t.shape}, X_test={X_test_t.shape}"
+    smote = SMOTE(
+        sampling_strategy=sampling_strategy,
+        k_neighbors=k_neighbors,
+        random_state=random_state,
+        n_jobs=-1,
     )
-
-    return (
-        X_train_t,
-        y_train,
-        X_val_t,
-        y_val,
-        X_test_t,
-        y_test,
-        model_pipeline,
-    )
+    return smote
 
 
-# ------------------------------------------------------------------------------
-# Imbalance handling
-# ------------------------------------------------------------------------------
-
-def resample_training_data(
+def resample_with_smotetomek(
     X_train,
-    y_train,
+    y_train: np.ndarray,
     cfg: Config,
 ):
     """
-    Apply advanced imbalance handling if imbalanced-learn is available.
-
-    Preferred: SMOTE-Tomek with BorderlineSMOTE (focusing on decision boundary).
-    Fallbacks:
-        - Manual BorderlineSMOTE + TomekLinks (when BorderlineSMOTE cannot be plugged into SMOTETomek)
-        - Standard SMOTE-Tomek
-        - Original data if resamplers are missing
+    Apply SMOTETomek (SMOTE + Tomek Links) on train set.
     """
-
-    if not cfg.use_smote_tomek:
-        logger.info("SMOTE-Tomek disabled via config; using original training data")
-        return X_train, y_train
-
-    smote_kind = (cfg.smote_kind or "regular").lower()
-    has_borderline = BorderlineSMOTE is not None
-
-    def _log_and_return(X, y, desc: str):
-        logger.info(
-            f"{desc} output: {X.shape}, fraud={int(y.sum())}, "
-            f"non-fraud={int((y == 0).sum())}"
-        )
-        return X, y
-
-    def _apply_borderline_then_tomek():
-        sampler = BorderlineSMOTE(
-            random_state=cfg.random_state,
-            kind="borderline-1",
-        )
-        start = time.time()
-        X_smote, y_smote = sampler.fit_resample(X_train, y_train)
-        elapsed = time.time() - start
-        logger.info("BorderlineSMOTE step elapsed=%.1fs", elapsed)
-        if TomekLinks is not None:
-            tomek = TomekLinks()
-            X_clean, y_clean = tomek.fit_resample(X_smote, y_smote)
-            return _log_and_return(X_clean, y_clean, "BorderlineSMOTE + TomekLinks")
-        logger.info("TomekLinks unavailable; returning BorderlineSMOTE-only resampled data")
-        return _log_and_return(X_smote, y_smote, "BorderlineSMOTE")
-
-    if smote_kind == "borderline" and has_borderline:
-        logger.info("Applying BorderlineSMOTE-focused resampling...")
-        if SMOTETomek is not None and SMOTE is not None:
-            try:
-                if issubclass(BorderlineSMOTE, SMOTE):
-                    sampler = SMOTETomek(
-                        random_state=cfg.random_state,
-                        smote=BorderlineSMOTE(
-                            random_state=cfg.random_state,
-                            kind="borderline-1",
-                        ),
-                    )
-                    start = time.time()
-                    X_res, y_res = sampler.fit_resample(X_train, y_train)
-                    elapsed = time.time() - start
-                    logger.info("SMOTETomek (Borderline) elapsed=%.1fs", elapsed)
-                    return _log_and_return(X_res, y_res, "SMOTETomek (Borderline)")
-            except TypeError:
-                # Some imblearn versions wrap SMOTE in special types and issubclass fails.
-                pass
-        if BorderlineSMOTE is not None:
-            return _apply_borderline_then_tomek()
-        logger.info("BorderlineSMOTE unavailable; falling back to standard SMOTE-Tomek")
-
-    if SMOTETomek is None:
-        logger.info("SMOTETomek not available; using original training data")
-        return X_train, y_train
-
-    smote_estimator = None
-    if SMOTE is not None:
-        smote_estimator = SMOTE(random_state=cfg.random_state)
-
-    sampler = SMOTETomek(
+    log("[INFO] Applying SMOTETomek (SMOTE + Tomek Links) on train...")
+    smote = build_smote_base(
+        y_train,
+        oversample_factor=cfg.smotetomek_factor,
         random_state=cfg.random_state,
-        smote=smote_estimator,
     )
-    start = time.time()
-    X_res, y_res = sampler.fit_resample(X_train, y_train)
-    elapsed = time.time() - start
-    logger.info("SMOTETomek elapsed=%.1fs", elapsed)
-    return _log_and_return(X_res, y_res, "SMOTETomek")
+
+    smt = SMOTETomek(
+        smote=smote,
+        random_state=cfg.random_state,
+        n_jobs=-1,
+    )
+    X_res, y_res = smt.fit_resample(X_train, y_train)
+    log(
+        f"[INFO] After SMOTETomek: class counts={Counter(y_res)}, "
+        f"shape={X_res.shape}"
+    )
+    return X_res, y_res
 
 
-# ------------------------------------------------------------------------------
-# Threshold tuning and evaluation utilities
-# ------------------------------------------------------------------------------
+def resample_with_smoteenn(
+    X_train,
+    y_train: np.ndarray,
+    cfg: Config,
+):
+    """
+    Apply SMOTEENN (SMOTE + Edited Nearest Neighbors) on train set.
+    """
+    log("[INFO] Applying SMOTEENN (SMOTE + ENN) on train...")
+    smote = build_smote_base(
+        y_train,
+        oversample_factor=cfg.smoteenn_factor,
+        random_state=cfg.random_state,
+    )
 
-def find_best_threshold(
+    sme = SMOTEENN(
+        smote=smote,
+        random_state=cfg.random_state,
+        n_jobs=-1,
+    )
+    X_res, y_res = sme.fit_resample(X_train, y_train)
+    log(
+        f"[INFO] After SMOTEENN: class counts={Counter(y_res)}, "
+        f"shape={X_res.shape}"
+    )
+    return X_res, y_res
+
+
+# ---------------------------------------------------------------------------
+# Threshold tuning & evaluation utilities
+# ---------------------------------------------------------------------------
+
+def find_best_threshold_fbeta(
     y_true: np.ndarray,
     y_proba: np.ndarray,
     beta: float = 1.0,
 ) -> Tuple[float, float]:
     """
-    Find the probability threshold that maximizes F_beta using the PR curve.
+    Find probability threshold that maximizes F_beta via the PR curve.
     Returns (best_threshold, best_f_beta).
     """
     precision, recall, thresholds = precision_recall_curve(y_true, y_proba)
@@ -857,244 +388,143 @@ def precision_recall_at_k(
     frac: float = 0.01,
 ) -> Tuple[int, float, float]:
     """
-    Compute precision@K and recall@K where K is a fraction of the dataset (e.g., top 1%).
+    Precision@K and Recall@K for top frac of highest scores.
     """
     n = len(y_true)
     k = max(1, int(n * frac))
     idx = np.argsort(y_proba)[::-1][:k]
     y_top = y_true[idx]
-    prec_k = y_top.mean()
-    recall_k = y_top.sum() / max(1, y_true.sum())
-    return k, float(prec_k), float(recall_k)
+    prec_k = float(y_top.mean())
+    rec_k = float(y_top.sum() / max(1, y_true.sum()))
+    return k, prec_k, rec_k
 
 
 def evaluate_model(
     name: str,
     model,
     X_val,
-    y_val,
+    y_val: np.ndarray,
     X_test,
-    y_test,
+    y_test: np.ndarray,
     cfg: Config,
 ) -> Dict[str, Any]:
     """
-    Evaluate model on val + test, including threshold tuning and precision@K.
-
-    Returns a dict of metrics.
+    Evaluate model on validation and test sets:
+      - ROC-AUC, PR-AUC
+      - threshold tuned by F_beta on val
+      - classification_report (val & test)
+      - precision@top-K
     """
-    logger.info("=" * 70)
-    logger.info(f"Evaluating model: {name}")
+    log(f"[INFO] Evaluating model: {name}")
 
-    # Probabilities (fallback to decision_function if needed)
+    # Probabilities
     if hasattr(model, "predict_proba"):
         val_proba = model.predict_proba(X_val)[:, 1]
         test_proba = model.predict_proba(X_test)[:, 1]
     elif hasattr(model, "decision_function"):
-                val_scores = model.decision_function(X_val)
-                test_scores = model.decision_function(X_test)
-                # normalize scores to [0,1] via min-max
-                v_min, v_max = val_scores.min(), val_scores.max()
-                t_min, t_max = test_scores.min(), test_scores.max()
-                val_proba = (val_scores - v_min) / (v_max - v_min + 1e-9)
-                test_proba = (test_scores - t_min) / (t_max - t_min + 1e-9)
+        val_scores = model.decision_function(X_val)
+        test_scores = model.decision_function(X_test)
+        v_min, v_max = val_scores.min(), val_scores.max()
+        t_min, t_max = test_scores.min(), test_scores.max()
+        val_proba = (val_scores - v_min) / (v_max - v_min + 1e-9)
+        test_proba = (test_scores - t_min) / (t_max - t_min + 1e-9)
     else:
         raise ValueError(f"Model {name} does not support predict_proba or decision_function")
 
-    # AUC / PR-AUC
+    # ROC-AUC & PR-AUC
     val_auc = roc_auc_score(y_val, val_proba)
     test_auc = roc_auc_score(y_test, test_proba)
     val_ap = average_precision_score(y_val, val_proba)
     test_ap = average_precision_score(y_test, test_proba)
 
-    logger.info(
-        f"[{name}] Validation AUC={val_auc:.4f}, PR-AUC={val_ap:.4f} | "
-        f"Test AUC={test_auc:.4f}, PR-AUC={test_ap:.4f}"
+    log(
+        f"[{name}] Val ROC-AUC={val_auc:.4f}, PR-AUC={val_ap:.4f} | "
+        f"Test ROC-AUC={test_auc:.4f}, PR-AUC={test_ap:.4f}"
     )
 
-    # Threshold tuning on validation set
-    best_t, best_f_beta = find_best_threshold(y_val, val_proba, beta=cfg.f_beta)
-    logger.info(
-        f"[{name}] Best threshold (F_{cfg.f_beta:.1f} on val) = {best_t:.4f}, "
-        f"F_{cfg.f_beta:.1f}={best_f_beta:.4f}"
+    # Threshold tuning (F_beta on validation PR curve)
+    best_t, best_fbeta = find_best_threshold_fbeta(y_val, val_proba, beta=cfg.f_beta)
+    log(
+        f"[{name}] Best threshold (F_{cfg.f_beta:.1f} on val)={best_t:.4f}, "
+        f"F_{cfg.f_beta:.1f}={best_fbeta:.4f}"
     )
 
-    # Apply threshold
     val_pred = (val_proba >= best_t).astype(int)
     test_pred = (test_proba >= best_t).astype(int)
 
     val_f1 = f1_score(y_val, val_pred)
     test_f1 = f1_score(y_test, test_pred)
 
-    logger.info(f"[{name}] Validation F1={val_f1:.4f}, Test F1={test_f1:.4f}")
+    log(f"[{name}] Validation F1 at best_t={val_f1:.4f}, Test F1={test_f1:.4f}")
 
-    # Classification reports
     if cfg.verbose_reports:
-        val_report = classification_report(y_val, val_pred, digits=4)
-        test_report = classification_report(y_test, test_pred, digits=4)
-        logger.info(f"[{name}] Classification report (Validation):")
-        logger.info("\n" + val_report)
-        logger.info(f"[{name}] Classification report (Test):")
-        logger.info("\n" + test_report)
-    else:
-        val_report = ""
-        test_report = ""
+        log(f"[{name}] Classification report (Validation):")
+        log(classification_report(y_val, val_pred, digits=4))
+        log(f"[{name}] Classification report (Test):")
+        log(classification_report(y_test, test_pred, digits=4))
 
-    # Precision@K (top fraction of test scores)
+    # Precision@top-K on test
     k, prec_k, rec_k = precision_recall_at_k(
         y_test,
         test_proba,
         frac=cfg.top_k_frac,
     )
-    logger.info(
+    log(
         f"[{name}] Precision@top-{cfg.top_k_frac*100:.1f}% (K={k}): "
         f"precision={prec_k:.4f}, recall={rec_k:.4f}"
     )
 
-    metrics = {
+    return {
         "val_auc": val_auc,
         "test_auc": test_auc,
         "val_ap": val_ap,
         "test_ap": test_ap,
-        "val_f1_at_best_t": val_f1,
-        "test_f1_at_best_t": test_f1,
         "best_threshold": best_t,
-        "best_f_beta": best_f_beta,
+        "best_fbeta": best_fbeta,
+        "val_f1": val_f1,
+        "test_f1": test_f1,
         "precision_at_k": prec_k,
         "recall_at_k": rec_k,
         "k": k,
-        "val_report": val_report,
-        "test_report": test_report,
     }
-    return metrics
 
 
-# ------------------------------------------------------------------------------
-# Model training: RandomForest, LightGBM, XGBoost
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Model training helpers
+# ---------------------------------------------------------------------------
 
 def train_random_forest(
     X_train,
-    y_train,
-    X_val,
-    y_val,
+    y_train: np.ndarray,
     cfg: Config,
 ):
-    """
-    Train a reasonably regularized RandomForestClassifier.
-    Uses warm_start in chunks and explicit class weights to avoid the
-    warm_start + 'balanced_subsample' warning.
-    """
-    logger.info("=" * 70)
-    logger.info("Training RandomForestClassifier (regularized)")
-
-    # How many trees in total, and how many per warm-start chunk
-    total_trees = max(1, int(cfg.rf_n_estimators))
-    chunk = max(1, min(int(cfg.rf_warm_start_chunk), total_trees))
-    warm = total_trees > chunk
-
-    # ------------------------------------------------------------------
-    # Compute explicit class weights instead of 'balanced_subsample'
-    # ------------------------------------------------------------------
-    y_arr = np.asarray(y_train)
-    unique_classes = np.unique(y_arr)
-
-    class_weight = None
-    if len(unique_classes) > 1:
-        weights = compute_class_weight(
-            class_weight="balanced",
-            classes=unique_classes,
-            y=y_arr,
-        )
-        class_weight = {cls: w for cls, w in zip(unique_classes, weights)}
-        logger.info("RandomForest class_weight mapping: %s", class_weight)
-    else:
-        logger.warning(
-            "RandomForest y_train has only one class (%s); "
-            "skipping class_weight.",
-            unique_classes[0],
-        )
-
+    log("[INFO] Training RandomForestClassifier...")
     rf = RandomForestClassifier(
-        n_estimators=chunk if warm else total_trees,
+        n_estimators=200,
         max_depth=10,
-        min_samples_split=50,
-        min_samples_leaf=20,
+        min_samples_split=20,
+        min_samples_leaf=10,
         max_features="sqrt",
-        n_jobs=int(cfg.rf_n_jobs),
-        class_weight=class_weight,
-        random_state=int(cfg.random_state),
-        warm_start=warm,
+        n_jobs=-1,
+        random_state=cfg.random_state,
+        class_weight=None,  # imbalance handled via resampling
     )
-
-    # ------------------------------------------------------------------
-    # Warm-start loop: build trees in chunks, logging progress
-    # ------------------------------------------------------------------
-    trees_built = 0
-    overall_start = time.time()
-
-    while trees_built < total_trees:
-        target_trees = min(total_trees, trees_built + chunk)
-        rf.set_params(n_estimators=target_trees)
-
-        start = time.time()
-        rf.fit(X_train, y_train)
-        duration = time.time() - start
-
-        trees_built = target_trees
-        logger.info(
-            "  -> RandomForest progress: %d/%d trees (%.1fs this chunk)",
-            trees_built,
-            total_trees,
-            duration,
-        )
-
-    logger.info(
-        "RandomForest training complete in %.1fs", time.time() - overall_start
-    )
+    rf.fit(X_train, y_train)
     return rf
 
 
 def train_lightgbm(
     X_train,
-    y_train,
+    y_train: np.ndarray,
     X_val,
-    y_val,
+    y_val: np.ndarray,
     cfg: Config,
 ):
-    """
-    Train a LightGBM model with early stopping and regularization.
-    Uses LightGBM >= 4.0 callback API for early stopping.
-    """
-    if LGBMClassifier is None:
-        logger.warning("LightGBM not installed; skipping LGBM model.")
-        return None
+    log("[INFO] Training LightGBM (LGBMClassifier) with early stopping...")
 
-    logger.info("=" * 70)
-    logger.info("Training LightGBMClassifier (regularized + early stopping)")
-
-    # ------------------------------------------------------------------
-    # Handle class imbalance via scale_pos_weight / is_unbalance
-    # ------------------------------------------------------------------
-    y_arr = np.asarray(y_train)
-    pos = int(y_arr.sum())
-    neg = int(len(y_arr) - pos)
-
-    if pos > 0 and neg > 0:
-        scale_pos_weight = neg / float(pos)
-        logger.info(
-            "LightGBM scale_pos_weight computed as neg/pos = %d/%d = %.4f",
-            neg,
-            pos,
-            scale_pos_weight,
-        )
-    else:
-        scale_pos_weight = 1.0
-        logger.warning(
-            "LightGBM got y_train with only one class; "
-            "using scale_pos_weight=1.0"
-        )
-
+    # On resampled data, we typically don't need big scale_pos_weight.
     lgbm = LGBMClassifier(
+        objective="binary",
         n_estimators=1000,
         learning_rate=0.05,
         num_leaves=31,
@@ -1104,85 +534,35 @@ def train_lightgbm(
         reg_alpha=0.1,
         reg_lambda=0.5,
         min_child_samples=50,
-        objective="binary",
-        # for binary classification, use scale_pos_weight / is_unbalance
-        is_unbalance=True,
-        scale_pos_weight=scale_pos_weight,
-        random_state=int(cfg.random_state),
+        random_state=cfg.random_state,
         n_jobs=-1,
+        is_unbalance=False,
+        scale_pos_weight=1.0,
     )
 
-    # ------------------------------------------------------------------
-    # LightGBM >= 4.0 early stopping via callbacks
-    # ------------------------------------------------------------------
-    callbacks = []
-    if "lgb" in globals() and lgb is not None:
-        callbacks = [
-            lgb.early_stopping(stopping_rounds=50, verbose=True),
-            lgb.log_evaluation(period=10),
-        ]
-        logger.info("Using LightGBM callbacks for early stopping.")
-    else:
-        logger.warning(
-            "Full `lightgbm` package not available; "
-            "fitting without early stopping callbacks."
-        )
+    callbacks = [
+        lgb.early_stopping(stopping_rounds=50, verbose=True),
+        lgb.log_evaluation(period=50),
+    ]
 
-    if callbacks:
-        lgbm.fit(
-            X_train,
-            y_train,
-            eval_set=[(X_val, y_val)],
-            eval_metric="auc",
-            callbacks=callbacks,
-        )
-    else:
-        # Fallback: no early stopping, but still evaluate on val
-        lgbm.fit(
-            X_train,
-            y_train,
-            eval_set=[(X_val, y_val)],
-            eval_metric="auc",
-        )
-
+    lgbm.fit(
+        X_train,
+        y_train,
+        eval_set=[(X_val, y_val)],
+        eval_metric="auc",
+        callbacks=callbacks,
+    )
     return lgbm
 
 
 def train_xgboost(
     X_train,
-    y_train,
+    y_train: np.ndarray,
     X_val,
-    y_val,
+    y_val: np.ndarray,
     cfg: Config,
 ):
-    """
-    Train an XGBoostClassifier with regularization & early stopping (if available).
-    """
-    if XGBClassifier is None:
-        logger.warning("XGBoost not installed; skipping XGBoost model.")
-        return None
-
-    logger.info("=" * 70)
-    logger.info("Training XGBoostClassifier (regularized + early stopping)")
-
-    y_arr = np.asarray(y_train)
-    pos = int(y_arr.sum())
-    neg = int(len(y_arr) - pos)
-
-    if pos > 0 and neg > 0:
-        scale_pos_weight = neg / float(pos)
-        logger.info(
-            "XGBoost scale_pos_weight computed as neg/pos = %d/%d = %.4f",
-            neg,
-            pos,
-            scale_pos_weight,
-        )
-    else:
-        scale_pos_weight = 1.0
-        logger.warning(
-            "XGBoost got y_train with only one class; "
-            "using scale_pos_weight=1.0"
-        )
+    log("[INFO] Training XGBoostClassifier with early stopping...")
 
     xgb = XGBClassifier(
         n_estimators=1000,
@@ -1197,8 +577,8 @@ def train_xgboost(
         tree_method="hist",
         n_jobs=-1,
         eval_metric="auc",
-        random_state=int(cfg.random_state),
-        scale_pos_weight=scale_pos_weight,
+        random_state=cfg.random_state,
+        scale_pos_weight=1.0,  # resampled, so keep this neutral
         use_label_encoder=False,
     )
 
@@ -1209,92 +589,52 @@ def train_xgboost(
         verbose=True,
         early_stopping_rounds=50,
     )
-
     return xgb
 
 
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Orchestration
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
-def run_pipeline(cfg: Config) -> Dict[str, Dict[str, Any]]:
+def run_for_resampler(
+    resampler_name: str,
+    X_train,
+    y_train: np.ndarray,
+    X_val,
+    y_val: np.ndarray,
+    X_test,
+    y_test: np.ndarray,
+    cfg: Config,
+) -> Dict[str, Dict[str, Any]]:
     """
-    Full local pipeline:
-    - Load data
-    - Clean / normalize
-    - Mess up data
-    - Merge & label
-    - Split train/val/test
-    - Feature engineering
-    - Preprocessing / feature matrix
-    - SMOTE-Tomek resampling (optional)
-    - Train RF / LGBM / XGB
-    - Evaluate each model
+    Apply given resampler (smotetomek or smoteenn), then train & evaluate models.
+    Returns a dict mapping model_name -> metrics.
     """
-    logger.info("=" * 70)
-    logger.info("TECHM FRAUD DETECTION PIPELINE - GOD TIER LOCAL VERSION")
-    logger.info("=" * 70)
-    logger.info("Config: " + json.dumps(asdict(cfg), indent=2, default=str))
+    if resampler_name == "smotetomek":
+        X_train_res, y_train_res = resample_with_smotetomek(X_train, y_train, cfg)
+    elif resampler_name == "smoteenn":
+        X_train_res, y_train_res = resample_with_smoteenn(X_train, y_train, cfg)
+    else:
+        raise ValueError(f"Unknown resampler: {resampler_name}")
 
-    rng = np.random.RandomState(cfg.random_state)
-
-    # Make sure directories exist
-    cfg.data_dir.mkdir(parents=True, exist_ok=True)
-    cfg.sample_dir.mkdir(parents=True, exist_ok=True)
-
-    # 1) Load raw JSONL
-    df_trx_raw, df_ecm_raw = load_sample_jsonl(cfg)
-
-    # 2) Clean / normalize
-    df_trx_clean, df_ecm_clean = clean_and_normalize_raw(df_trx_raw, df_ecm_raw, cfg)
-
-    # 3) Make data messy for robustness testing
-    df_trx_messy, df_ecm_messy = make_data_messy(df_trx_clean, df_ecm_clean, cfg, rng)
-
-    # 4) Merge & label
-    merged = merge_trx_and_ecm(df_trx_messy, df_ecm_messy, cfg)
-
-    # 5) Split train/val/test
-    train_df, val_df, test_df = split_train_val_test(merged, cfg)
-
-    # 6) Feature engineering
-    train_fe, val_fe, test_fe = engineer_features(train_df, val_df, test_df, cfg)
-
-    # 7) Preprocessing / feature matrix
-    (
-        X_train,
-        y_train,
-        X_val,
-        y_val,
-        X_test,
-        y_test,
-        preprocess_pipeline,
-    ) = build_feature_matrix(train_fe, val_fe, test_fe, cfg)
-
-    # 8) Resample training data (SMOTE-Tomek + BorderlineSMOTE)
-    X_train_res, y_train_res = resample_training_data(X_train, y_train, cfg)
-
-    # 9) Train models
     metrics_by_model: Dict[str, Dict[str, Any]] = {}
 
-    # RandomForest
-    rf = train_random_forest(X_train_res, y_train_res, X_val, y_val, cfg)
-    rf_metrics = evaluate_model(
-        "RandomForest",
-        rf,
-        X_val,
-        y_val,
-        X_test,
-        y_test,
-        cfg,
-    )
-    metrics_by_model["RandomForest"] = rf_metrics
+    if "rf" in cfg.models:
+        rf = train_random_forest(X_train_res, y_train_res, cfg)
+        metrics_by_model["RandomForest"] = evaluate_model(
+            f"{resampler_name.upper()} + RandomForest",
+            rf,
+            X_val,
+            y_val,
+            X_test,
+            y_test,
+            cfg,
+        )
 
-    # LightGBM
-    lgbm = train_lightgbm(X_train_res, y_train_res, X_val, y_val, cfg)
-    if lgbm is not None:
-        lgbm_metrics = evaluate_model(
-            "LightGBM",
+    if "lgbm" in cfg.models:
+        lgbm = train_lightgbm(X_train_res, y_train_res, X_val, y_val, cfg)
+        metrics_by_model["LightGBM"] = evaluate_model(
+            f"{resampler_name.upper()} + LightGBM",
             lgbm,
             X_val,
             y_val,
@@ -1302,13 +642,11 @@ def run_pipeline(cfg: Config) -> Dict[str, Dict[str, Any]]:
             y_test,
             cfg,
         )
-        metrics_by_model["LightGBM"] = lgbm_metrics
 
-    # XGBoost
-    xgb = train_xgboost(X_train_res, y_train_res, X_val, y_val, cfg)
-    if xgb is not None:
-        xgb_metrics = evaluate_model(
-            "XGBoost",
+    if "xgb" in cfg.models:
+        xgb = train_xgboost(X_train_res, y_train_res, X_val, y_val, cfg)
+        metrics_by_model["XGBoost"] = evaluate_model(
+            f"{resampler_name.upper()} + XGBoost",
             xgb,
             X_val,
             y_val,
@@ -1316,25 +654,155 @@ def run_pipeline(cfg: Config) -> Dict[str, Dict[str, Any]]:
             y_test,
             cfg,
         )
-        metrics_by_model["XGBoost"] = xgb_metrics
 
-    logger.info("=" * 70)
-    logger.info("PIPELINE EXECUTION COMPLETE!")
-    logger.info("=" * 70)
-    logger.info("Models trained: %s", list(metrics_by_model.keys()))
     return metrics_by_model
 
 
-def main() -> None:
-    seed_everything(42)
-    cfg = Config()
-    run_pipeline(cfg)
+def main():
+    parser = argparse.ArgumentParser(
+        description="Hybrid (SMOTETomek / SMOTEENN) resampling + multi-model training."
+    )
+    parser.add_argument(
+        "--transactions-path",
+        type=str,
+        default="transactions.jsonl",
+        help="Path to transactions.jsonl (with FRAUD_IND).",
+    )
+    parser.add_argument(
+        "--test-size",
+        type=float,
+        default=0.2,
+        help="Test fraction (default=0.2).",
+    )
+    parser.add_argument(
+        "--val-size",
+        type=float,
+        default=0.1,
+        help="Validation fraction relative to full dataset (default=0.1).",
+    )
+    parser.add_argument(
+        "--smotetomek-factor",
+        type=float,
+        default=10.0,
+        help="Oversample factor for SMOTETomek (default=10.0).",
+    )
+    parser.add_argument(
+        "--smoteenn-factor",
+        type=float,
+        default=10.0,
+        help="Oversample factor for SMOTEENN (default=10.0).",
+    )
+    parser.add_argument(
+        "--f-beta",
+        type=float,
+        default=1.0,
+        help="F_beta used for threshold tuning (default=1.0).",
+    )
+    parser.add_argument(
+        "--top-k-frac",
+        type=float,
+        default=0.01,
+        help="Top fraction for Precision@K (default=0.01 = top 1%%).",
+    )
+    parser.add_argument(
+        "--resamplers",
+        type=str,
+        nargs="+",
+        default=["smotetomek", "smoteenn"],
+        help="Which resamplers to run: smotetomek, smoteenn.",
+    )
+    parser.add_argument(
+        "--models",
+        type=str,
+        nargs="+",
+        default=["rf", "lgbm", "xgb"],
+        help="Which models to run: rf, lgbm, xgb.",
+    )
+
+    args = parser.parse_args()
+
+    cfg = Config(
+        transactions_path=Path(args.transactions_path),
+        test_size=args.test_size,
+        val_size=args.val_size,
+        smotetomek_factor=args.smotetomek_factor,
+        smoteenn_factor=args.smoteenn_factor,
+        f_beta=args.f_beta,
+        top_k_frac=args.top_k_frac,
+        resamplers=tuple(args.resamplers),
+        models=tuple(args.models),
+    )
+
+    seed_everything(cfg.random_state)
+
+    log("[INFO] Config:")
+    log(json.dumps(asdict(cfg), indent=2, default=str))
+
+    # Load & split
+    df = load_transactions(cfg)
+    train_df, val_df, test_df = stratified_split(df, cfg)
+
+    # Preprocessing
+    preprocessor, feature_cols = build_preprocessor(train_df, cfg)
+
+    X_train_raw = train_df[feature_cols]
+    X_val_raw = val_df[feature_cols]
+    X_test_raw = test_df[feature_cols]
+
+    y_train = train_df[cfg.label_col].values
+    y_val = val_df[cfg.label_col].values
+    y_test = test_df[cfg.label_col].values
+
+    log("[INFO] Fitting preprocessing pipeline on train...")
+    preprocessor.fit(X_train_raw)
+
+    log("[INFO] Transforming train/val/test...")
+    X_train = preprocessor.transform(X_train_raw)
+    X_val = preprocessor.transform(X_val_raw)
+    X_test = preprocessor.transform(X_test_raw)
+
+    log(
+        f"[INFO] Feature shapes: "
+        f"X_train={X_train.shape}, X_val={X_val.shape}, X_test={X_test.shape}"
+    )
+
+    # Run for each resampler
+    all_results: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
+    for res_name in cfg.resamplers:
+        res_name_lower = res_name.lower()
+        if res_name_lower not in {"smotetomek", "smoteenn"}:
+            log(f"[WARN] Skipping unknown resampler: {res_name}")
+            continue
+
+        log("=" * 80)
+        log(f"[INFO] >>> Resampler: {res_name_lower.upper()} <<<")
+        res_metrics = run_for_resampler(
+            res_name_lower,
+            X_train,
+            y_train,
+            X_val,
+            y_val,
+            X_test,
+            y_test,
+            cfg,
+        )
+        all_results[res_name_lower] = res_metrics
+
+    log("=" * 80)
+    log("[INFO] SUMMARY (val/test metrics):")
+    for res_name, model_metrics in all_results.items():
+        for model_name, metrics in model_metrics.items():
+            log(
+                f"{res_name.upper()} + {model_name}: "
+                f"Val AUC={metrics['val_auc']:.4f}, "
+                f"Test AUC={metrics['test_auc']:.4f}, "
+                f"Val F1={metrics['val_f1']:.4f}, "
+                f"Test F1={metrics['test_f1']:.4f}, "
+                f"P@K={metrics['precision_at_k']:.4f}, "
+                f"R@K={metrics['recall_at_k']:.4f}"
+            )
 
 
 if __name__ == "__main__":
-    try:
-        main()
-        sys.exit(0)
-    except Exception as e:
-        logger.error(f"Pipeline failed: {e}", exc_info=True)
-        sys.exit(1)
+    main()
