@@ -1,0 +1,19 @@
+# TechM Fraud Detection Pipeline - Exact Local Replication
+# Locked dependency versions for reproducible local runs (Python 3.9+)
+
+# Core science stack
+numpy==1.26.4
+pandas==2.1.4
+pyarrow==15.0.2
+
+# Spark runtime
+pyspark==3.5.1
+
+# Tree-based models
+lightgbm==4.5.0
+xgboost==2.1.1
+
+# Utilities used in notebooks/documentation parity
+matplotlib==3.8.3
+scikit-learn==1.4.2
+imblearn
