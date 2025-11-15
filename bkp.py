@@ -642,6 +642,86 @@ def engineer_features(
 
 
 # ------------------------------------------------------------------------------
+# Combined Train+Val Resampling for Extreme Imbalance
+# ------------------------------------------------------------------------------
+
+def resample_train_val_combined(
+    train_fe: pd.DataFrame,
+    val_fe: pd.DataFrame,
+    cfg: Config,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    For extreme class imbalance with few fraud cases, apply SMOTE to combined train+val.
+
+    This ensures both train and val have synthetic fraud cases for proper validation.
+    Does NOT resample test set (kept pure for final evaluation).
+
+    Steps:
+    1. Combine train + val dataframes
+    2. Extract features (X) and labels (y)
+    3. Apply SMOTE + TomekLinks to create synthetic fraud cases
+    4. Re-split combined resampled data back into train/val using original proportions
+    5. Return resampled train_fe and val_fe with synthetic fraud cases
+    """
+    original_train_size = len(train_fe)
+    original_val_size = len(val_fe)
+    total_size = original_train_size + original_val_size
+
+    logger.info("[STEP] Applying SMOTE to combined train+val for extreme imbalance handling")
+    logger.info(f"  Original train size: {original_train_size}, val size: {original_val_size}")
+    logger.info(
+        f"  Original fraud distribution: train={int(train_fe[cfg.label_col].sum())}, "
+        f"val={int(val_fe[cfg.label_col].sum())}"
+    )
+
+    # Combine train + val
+    combined = pd.concat([train_fe, val_fe], ignore_index=True)
+    X_combined = combined.drop(columns=[cfg.label_col], errors="ignore")
+    y_combined = combined[cfg.label_col].values.astype(int)
+
+    # Apply SMOTE if available
+    if SMOTETomek is None:
+        logger.warning("SMOTE not available; returning original train/val without resampling")
+        return train_fe, val_fe
+
+    logger.info("  Applying SMOTE + TomekLinks to create synthetic fraud cases...")
+    try:
+        sampler = SMOTETomek(random_state=cfg.random_state)
+        X_resampled, y_resampled = sampler.fit_resample(X_combined, y_combined)
+        X_resampled = pd.DataFrame(X_resampled, columns=X_combined.columns)
+    except Exception as e:
+        logger.warning(f"  SMOTE failed ({e}); returning original train/val")
+        return train_fe, val_fe
+
+    # Reconstruct combined dataframe with resampled data
+    combined_resampled = X_resampled.copy()
+    combined_resampled[cfg.label_col] = y_resampled
+
+    new_total_size = len(combined_resampled)
+    logger.info(f"  After SMOTE: {new_total_size} rows (created {new_total_size - total_size} synthetic fraud cases)")
+    logger.info(
+        f"  Resampled fraud distribution: {int(y_resampled.sum())} fraud, {int((y_resampled == 0).sum())} non-fraud"
+    )
+
+    # Re-split back into train/val using original proportions
+    # Calculate train/val split point based on original proportions
+    train_fraction = original_train_size / total_size
+    split_point = int(train_fraction * new_total_size)
+
+    train_resampled = combined_resampled.iloc[:split_point].reset_index(drop=True)
+    val_resampled = combined_resampled.iloc[split_point:].reset_index(drop=True)
+
+    logger.info(
+        f"  Re-split: train={len(train_resampled)} "
+        f"(fraud={int(train_resampled[cfg.label_col].sum())}), "
+        f"val={len(val_resampled)} "
+        f"(fraud={int(val_resampled[cfg.label_col].sum())})"
+    )
+
+    return train_resampled, val_resampled
+
+
+# ------------------------------------------------------------------------------
 # Intelligent Cardinality-based Encoding
 # ------------------------------------------------------------------------------
 
@@ -1314,6 +1394,11 @@ def run_pipeline(cfg: Config) -> Dict[str, Dict[str, Any]]:
     # 6. Feature engineering
     train_fe, val_fe, test_fe = engineer_features(train_df, val_df, test_df, cfg)
 
+    # 6.5. Apply SMOTE to combined train+val for extreme imbalance
+    # This ensures both train and val have synthetic fraud cases for proper validation
+    # Test set is NOT resampled (kept pure for final evaluation)
+    train_fe, val_fe = resample_train_val_combined(train_fe, val_fe, cfg)
+
     # 7. Build feature matrices
     (
         X_train,
@@ -1325,7 +1410,8 @@ def run_pipeline(cfg: Config) -> Dict[str, Dict[str, Any]]:
         preprocess_pipeline,
     ) = build_feature_matrix(train_fe, val_fe, test_fe, cfg)
 
-    # 8. Resample training data for imbalance
+    # 8. Additional resampling of X_train only (for further class balance refinement if desired)
+    # Note: train+val were already resampled in step 6.5, so this is optional fine-tuning
     X_train_res, y_train_res = resample_training_data(X_train, y_train, cfg)
 
     results: Dict[str, Dict[str, Any]] = {}
