@@ -23,9 +23,81 @@ import json
 import os
 from pathlib import Path
 from datetime import datetime, timedelta
+import math
 import random
 import string
-from typing import Dict, Any, List
+from typing import Any, Dict, List, Optional, Tuple
+
+
+CHANNELS = ["WEB", "MOBILE", "ATM"]
+CUSTOMER_SEGMENTS = ["Mass", "Mass Affluent", "SMB", "Private", "Corporate"]
+PROFESSIONS = ["Engineer", "Teacher", "Retailer", "Consultant", "Doctor", "Analyst"]
+ECONOMIC_ACTIVITIES = ["Services", "Manufacturing", "Agriculture", "Mining", "Technology"]
+LANGUAGE_CHOICES = ["es", "en", "pt"]
+DEVICE_OS_OPTIONS = [
+    ("Android", "ANDROID_13"),
+    ("iOS", "IOS_17"),
+    ("Windows", "WIN_11"),
+    ("macOS", "MAC_OS"),
+]
+
+COUNTRY_LOCATIONS: Dict[str, List[Dict[str, str]]] = {
+    "CO": [
+        {"city": "Bogota", "region": "Cundinamarca"},
+        {"city": "Medellin", "region": "Antioquia"},
+        {"city": "Cali", "region": "Valle del Cauca"},
+    ],
+    "US": [
+        {"city": "New York", "region": "NY"},
+        {"city": "Miami", "region": "FL"},
+        {"city": "San Francisco", "region": "CA"},
+    ],
+    "MX": [
+        {"city": "Mexico City", "region": "CDMX"},
+        {"city": "Monterrey", "region": "Nuevo Leon"},
+        {"city": "Guadalajara", "region": "Jalisco"},
+    ],
+    "BR": [
+        {"city": "Sao Paulo", "region": "SP"},
+        {"city": "Rio de Janeiro", "region": "RJ"},
+        {"city": "Porto Alegre", "region": "RS"},
+    ],
+    "AR": [
+        {"city": "Buenos Aires", "region": "BA"},
+        {"city": "Cordoba", "region": "CB"},
+        {"city": "Rosario", "region": "SF"},
+    ],
+    "ES": [
+        {"city": "Madrid", "region": "Madrid"},
+        {"city": "Barcelona", "region": "Catalonia"},
+        {"city": "Seville", "region": "Andalusia"},
+    ],
+}
+
+FIRST_NAMES = [
+    "Maria",
+    "Juan",
+    "Laura",
+    "Carlos",
+    "Ana",
+    "Luis",
+    "Camila",
+    "Pedro",
+    "Daniel",
+    "Sofia",
+]
+LAST_NAMES = [
+    "Gomez",
+    "Rodriguez",
+    "Martinez",
+    "Perez",
+    "Ruiz",
+    "Sanchez",
+    "Lopez",
+    "Torres",
+    "Castro",
+    "Vargas",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -310,7 +382,7 @@ def random_string(max_len: int) -> str:
 
 
 def random_country_code() -> str:
-    return random.choice(["CO", "US", "MX", "BR", "AR", "ES"])
+    return random.choice(list(COUNTRY_LOCATIONS.keys()))
 
 
 def random_currency() -> str:
@@ -345,11 +417,163 @@ def random_int_by_digits(digits: int) -> int:
     return random.randint(lo, hi)
 
 
+def sigmoid(z: float) -> float:
+    try:
+        return 1.0 / (1.0 + math.exp(-z))
+    except OverflowError:
+        return 0.0 if z < 0 else 1.0
+
+
+def clip01(x: float) -> float:
+    return max(0.0, min(1.0, x))
+
+
+def random_full_name() -> str:
+    return f"{random.choice(FIRST_NAMES)} {random.choice(LAST_NAMES)}"
+
+
+def pick_location(country: str) -> Dict[str, str]:
+    return random.choice(COUNTRY_LOCATIONS.get(country, COUNTRY_LOCATIONS["CO"]))
+
+
+def pick_alert_text(reasons: List[str], triggered: bool) -> str:
+    if not triggered:
+        return "No anomaly detected"
+    if not reasons:
+        reasons = ["Rule threshold exceeded"]
+    return " | ".join(reasons)
+
+
+def create_device_profile(customer_no: str) -> Dict[str, str]:
+    suffix = "".join(random.choice("0123456789ABCDEF") for _ in range(10))
+    device_id = f"DEV-{customer_no[-4:]}-{suffix}"
+    os_name, os_code = random.choice(DEVICE_OS_OPTIONS)
+    return device_id, {
+        "DEVICE_OPERATING_SYSTEM_NO": os_code,
+        "OS_NAME": os_name,
+    }
+
+
+def sample_transaction_datetime(night_prob: float) -> datetime:
+    start = datetime.now() - timedelta(days=730)
+    dt = start + timedelta(days=random.randint(0, 729))
+    if random.random() < night_prob:
+        hour = random.choice([0, 1, 2, 3, 4, 23])
+    else:
+        hour = random.randint(7, 21)
+    minute = random.randint(0, 59)
+    second = random.randint(0, 59)
+    return dt.replace(hour=hour, minute=minute, second=second, microsecond=0)
+
+
+def build_customer_profiles(
+    n_customers: int,
+    device_registry: Dict[str, Dict[str, str]],
+) -> List[Dict[str, Any]]:
+    customers: List[Dict[str, Any]] = []
+    for idx in range(n_customers):
+        customer_no = f"CUST-{idx:06d}"
+        country = random_country_code()
+        location = pick_location(country)
+        profile: Dict[str, Any] = {
+            "customer_no": customer_no,
+            "client_no": f"CL-{idx:06d}",
+            "client_name": random_full_name(),
+            "home_country": country,
+            "city": location["city"],
+            "region": location["region"],
+            "segment": random.choice(CUSTOMER_SEGMENTS),
+            "profession": random.choice(PROFESSIONS),
+            "economic_activity": random.choice(ECONOMIC_ACTIVITIES),
+            "preferred_currency": random.choice(["COP", "COP", "USD", "EUR"]),
+            "language": "es" if country in {"CO", "MX", "AR", "ES"} else ("pt" if country == "BR" else "en"),
+            "amount_mu": random.uniform(8.0, 10.0),
+            "night_owl_prob": random.uniform(0.05, 0.35),
+            "intl_propensity": random.uniform(0.05, 0.4),
+            "channel_weights": [random.uniform(0.3, 1.0) for _ in CHANNELS],
+        }
+        profile["accounts"] = [
+            f"ACC-{customer_no[-4:]}-{j:02d}" for j in range(random.randint(1, 3))
+        ]
+        profile["devices"] = []
+        for _ in range(random.randint(1, 3)):
+            device_id, metadata = create_device_profile(customer_no)
+            profile["devices"].append(device_id)
+            device_registry[device_id] = metadata
+        profile["ips"] = [random_ip() for _ in range(random.randint(1, 4))]
+        profile["phones"] = [random_phone() for _ in range(random.randint(1, 3))]
+        profile["emails"] = [random_email() for _ in range(random.randint(1, 3))]
+        customers.append(profile)
+    return customers
+
+
+def build_destination_accounts(n_destinations: int) -> List[Dict[str, Any]]:
+    dests: List[Dict[str, Any]] = []
+    for idx in range(n_destinations):
+        country = random_country_code()
+        location = pick_location(country)
+        dests.append(
+            {
+                "account_no": f"DST-{idx:07d}",
+                "entity_name": f"Beneficiary {idx:05d}",
+                "country": country,
+                "city": location["city"],
+                "branch": f"{location['city']} Branch",
+                "risk_score": random.uniform(0.1, 0.9),
+                "weight": random.uniform(0.5, 3.0),
+            }
+        )
+    return dests
+
+
+def choose_channel(profile: Dict[str, Any]) -> str:
+    weights = profile.get("channel_weights") or [1.0 for _ in CHANNELS]
+    return random.choices(CHANNELS, weights=weights, k=1)[0]
+
+
+def select_device_for_customer(
+    profile: Dict[str, Any],
+    history: Dict[str, Any],
+    device_registry: Dict[str, Dict[str, str]],
+) -> Tuple[str, Dict[str, str], bool]:
+    use_new = random.random() < 0.15 or not profile["devices"]
+    if use_new:
+        device_id, metadata = create_device_profile(profile["customer_no"])
+        profile["devices"].append(device_id)
+        device_registry[device_id] = metadata
+    else:
+        device_id = random.choice(profile["devices"])
+        metadata = device_registry[device_id]
+    is_new = device_id not in history["seen_devices"]
+    history["seen_devices"].add(device_id)
+    return device_id, metadata, is_new
+
+
+def select_ip_for_customer(profile: Dict[str, Any], history: Dict[str, Any]) -> Tuple[str, bool]:
+    use_new = random.random() < 0.1 or not profile["ips"]
+    if use_new:
+        ip = random_ip()
+        profile["ips"].append(ip)
+    else:
+        ip = random.choice(profile["ips"])
+    is_new = ip not in history["seen_ips"]
+    history["seen_ips"].add(ip)
+    return ip, is_new
+
+
 # ---------------------------------------------------------------------------
 # 3. Value generator per field/type
 # ---------------------------------------------------------------------------
 
-def generate_trx_value(field: str, type_label: str, is_fraud: bool, trx_index: int) -> Any:
+def generate_trx_value(
+    field: str,
+    type_label: str,
+    is_fraud: bool,
+    trx_index: int,
+    context: Optional[Dict[str, Any]] = None,
+) -> Any:
+    if context and field in context:
+        return context[field]
     tl = type_label.upper()
 
     # Special cases / semantics first
@@ -494,7 +718,15 @@ def generate_trx_value(field: str, type_label: str, is_fraud: bool, trx_index: i
     return random_string(20)
 
 
-def generate_ecm_value(field: str, type_label: str, trx_row: Dict[str, Any], is_fraud: bool) -> Any:
+def generate_ecm_value(
+    field: str,
+    type_label: str,
+    trx_row: Dict[str, Any],
+    is_fraud: bool,
+    context: Optional[Dict[str, Any]] = None,
+) -> Any:
+    if context and field in context:
+        return context[field]
     tl = type_label.upper()
 
     # Link fields
@@ -590,40 +822,213 @@ def generate_datasets(
     trx_path = out_dir / "transactions.jsonl"
     ecm_path = out_dir / "ecm.jsonl"
 
-    # Decide fraud indices
-    n_fraud = int(round(n_transactions * fraud_ratio))
-    if n_fraud < 1:
-        n_fraud = 1  # ensure at least 1 fraud for tests
-    fraud_indices = set(random.sample(range(n_transactions), n_fraud))
+    trimmed_ratio = min(max(fraud_ratio, 1e-4), 0.95)
+    base_logit = math.log(trimmed_ratio / (1 - trimmed_ratio))
 
-    print(f"[INFO] Generating {n_transactions} transactions...")
-    print(f"[INFO] Target fraud ratio={fraud_ratio:.8f} -> {n_fraud} fraud rows")
+    n_customers = max(200, n_transactions // 5)
+    n_destinations = max(100, n_transactions // 10)
+    device_registry: Dict[str, Dict[str, str]] = {}
+    customers = build_customer_profiles(n_customers, device_registry)
+    dest_accounts = build_destination_accounts(n_destinations)
+    dest_weights = [dest["weight"] for dest in dest_accounts]
 
-    trx_fields: List[str] = list(TRX_FIELD_TYPES.keys())
-    ecm_fields: List[str] = list(ECM_FIELD_TYPES.keys())
+    customer_history = {
+        cust["customer_no"]: {
+            "seen_devices": set(),
+            "seen_ips": set(),
+            "seen_destinations": set(),
+            "fraud_count": 0,
+        }
+        for cust in customers
+    }
+
+    print(f"[INFO] Generating {n_transactions} transactions (target fraud ratio ≈ {fraud_ratio:.6f})")
+
+    trx_fields = list(TRX_FIELD_TYPES.keys())
+    ecm_fields = list(ECM_FIELD_TYPES.keys())
+
+    observed_fraud = 0
 
     with trx_path.open("w", encoding="utf-8") as f_trx, ecm_path.open("w", encoding="utf-8") as f_ecm:
         for i in range(n_transactions):
-            is_fraud = i in fraud_indices
+            profile = random.choice(customers)
+            history = customer_history[profile["customer_no"]]
+            account_no = random.choice(profile["accounts"])
 
-            # Build TRX row
+            device_id, device_meta, is_new_device = select_device_for_customer(profile, history, device_registry)
+            ip_address, is_new_ip = select_ip_for_customer(profile, history)
+            phone = random.choice(profile["phones"])
+            email = random.choice(profile["emails"])
+
+            dest = random.choices(dest_accounts, weights=dest_weights, k=1)[0]
+            if dest["country"] == profile["home_country"] and random.random() < profile["intl_propensity"]:
+                intl_options = [d for d in dest_accounts if d["country"] != profile["home_country"]]
+                if intl_options:
+                    dest = random.choice(intl_options)
+
+            is_new_dest = dest["account_no"] not in history["seen_destinations"]
+            history["seen_destinations"].add(dest["account_no"])
+
+            trx_dt = sample_transaction_datetime(profile["night_owl_prob"])
+            trx_date_int = int(trx_dt.strftime("%Y%m%d"))
+            trx_hour = trx_dt.hour
+
+            currency = profile["preferred_currency"]
+            raw_amount = math.exp(random.gauss(profile["amount_mu"], 0.8)) - 1.0
+            amount = round(max(5.0, raw_amount), 2)
+            if currency == "USD":
+                exchange_rate = 1.0
+                usd_amount = round(amount, 2)
+            else:
+                exchange_rate = random.uniform(3700, 4300)
+                usd_amount = round(amount / exchange_rate, 2)
+
+            log_amount_centered = math.log1p(amount) - 9.0
+            is_night = trx_hour < 6 or trx_hour >= 23
+            is_international = dest["country"] != profile["home_country"]
+            has_prior_fraud = history["fraud_count"] > 0
+
+            z = (
+                base_logit
+                + 0.8 * log_amount_centered
+                + 1.1 * int(is_new_device)
+                + 0.7 * int(is_new_ip)
+                + 0.9 * int(is_new_dest)
+                + 0.5 * int(is_night)
+                + 0.6 * int(is_international)
+                + 1.0 * int(has_prior_fraud)
+                + 0.6 * (dest["risk_score"] - 0.5)
+                + random.gauss(0, 0.8)
+            )
+            fraud_prob = sigmoid(z)
+            is_fraud = random.random() < fraud_prob
+            if (n_transactions - i) == 1 and observed_fraud == 0:
+                is_fraud = True
+
+            if is_fraud:
+                history["fraud_count"] += 1
+                observed_fraud += 1
+
+            alert_score = clip01(
+                0.4
+                + 0.25 * int(is_new_device)
+                + 0.2 * int(is_new_dest)
+                + 0.15 * int(is_new_ip)
+                + 0.15 * int(is_night)
+                + 0.15 * int(is_international)
+                + 0.1 * max(0.0, log_amount_centered)
+                + 0.1 * (dest["risk_score"] - 0.5)
+                + random.gauss(0, 0.12)
+            )
+            alert_triggered = alert_score > 0.55 or random.random() < 0.05
+
+            reasons: List[str] = []
+            if is_new_device:
+                reasons.append("Device not seen for this customer")
+            if is_new_dest:
+                reasons.append("Beneficiary never used")
+            if is_international:
+                reasons.append("International destination")
+            if log_amount_centered > 0.5:
+                reasons.append("Amount far above normal")
+            if is_night:
+                reasons.append("Night-time activity")
+            if alert_score > 0.75:
+                reasons.append("Risk score extremely high")
+            alert_text = pick_alert_text(reasons, alert_triggered)
+
+            if alert_triggered:
+                if is_fraud:
+                    result_type = random.choices(["FRAUD", "GENUINE"], weights=[0.8, 0.2])[0]
+                else:
+                    result_type = random.choices(["GENUINE", "FRAUD"], weights=[0.95, 0.05])[0]
+            else:
+                result_type = "GENUINE"
+
+            trx_ind = "ALERTED" if alert_triggered else "NO_ALERT"
+            if random.random() < 0.05:
+                trx_ind = "ALERTED" if trx_ind == "NO_ALERT" else "NO_ALERT"
+            correction_ind = "Y" if (result_type == "FRAUD" and not is_fraud and random.random() < 0.7) else "N"
+            subtype = random.choice(["INVESTIGATE", "CLOSED", "ESCALATED", "DISMISSED"])
+
+            channel = choose_channel(profile)
+            trx_context = {
+                "CUSTOMER_NO": profile["customer_no"],
+                "CLIENT_NO": profile["client_no"],
+                "CLIENT_NAME": profile["client_name"],
+                "ACCOUNT_NO": account_no,
+                "ACC_PRODUCT_NO": account_no,
+                "DESTINATION_ACCOUNT_NO": dest["account_no"],
+                "DST_ACC_PLACE_NAME": dest["city"],
+                "DST_ACC_BRANCH_NAME": dest["branch"],
+                "DESTINATION_COUNTRY_CD": dest["country"],
+                "DESTINATION_ENTITY_NAME": dest["entity_name"],
+                "DST_ACC_EMAIL_LINE": f"{dest['entity_name'].lower().replace(' ', '_')}@destbank.com",
+                "DST_ACC_TEL_NO": random_phone(),
+                "CURRENCY_CD": currency,
+                "TRX_TOTAL_AMT": amount,
+                "TRX_US_DOLLARS_AMT": usd_amount,
+                "EXCHANGE_RATE": exchange_rate,
+                "TRX_DATE": trx_date_int,
+                "TRANSACTION_DT": trx_date_int,
+                "TRX_HOUR": trx_hour,
+                "TRX_DT": trx_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                "TRANSACTION_DT_TIME": trx_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                "TRX_ORIGIN_CD": channel,
+                "TRX_GROUP_CD": channel,
+                "LOCAL_OR_INTERNATIONAL_CD": "INTERNATIONAL" if is_international else "LOCAL",
+                "CITY_OR_LOCATION_NAME": profile["city"],
+                "IP_REGION_NAME": profile["region"],
+                "IP_REGION_CD": f"{profile['home_country']}-{profile['region'][:3].upper()}",
+                "IP_COUNTRY_CD": profile["home_country"],
+                "CONNECTION_IP_NO": ip_address,
+                "LOCAL_IP_ADDRESS_NO": ip_address,
+                "DEVICE_HASH_NO": device_id,
+                "DEVICE_OPERATING_SYSTEM_NO": device_meta["DEVICE_OPERATING_SYSTEM_NO"],
+                "OS_NAME": device_meta["OS_NAME"],
+                "PHONE_CELL_NO": phone,
+                "PHONE_RESIDENCE_NO": phone,
+                "EMAIL_LINE": email,
+                "EMAIL_DOMAIN_NAME": email.split("@")[1],
+                "CUSTOMER_SEGMENT_NAME": profile["segment"],
+                "PROFESSION_NAME": profile["profession"],
+                "ECONOMIC_NAME": profile["economic_activity"],
+                "LANGUAGE_CD": profile["language"],
+                "AVAILABLE_AMT": round(amount * random.uniform(1.5, 4.0), 2),
+                "DESTINATION_PRODUCT_TYPE_CD": random.choice(["WIRE", "ACH", "SWIFT"]),
+                "CLIENT_RIM_TARGET_CD": "CORP" if profile["segment"] == "Corporate" else "RET",
+                "DEVICE_RISK_SCORE": int(30 + 60 * random.random()),
+                "BROWSING_HABITS_SCORE": int(30 + 60 * random.random()),
+                "COMP_ORG_ACC_SCORE": int(30 + 60 * random.random()),
+                "DST_ACC_ANALYSIS_SCORE": int(40 + 50 * dest["risk_score"]),
+                "FRAUD_IND": "1" if is_fraud else "0",
+            }
+
+            ecm_context = {
+                "RESULT_TYPE_CD": result_type,
+                "SUBTYPE_RESULT_CD": subtype,
+                "TRX_IND": trx_ind,
+                "CORRECTION_IND": correction_ind,
+                "ALERT_CONDITIONS_TEXT": alert_text,
+            }
+
             trx_row: Dict[str, Any] = {}
             for field in trx_fields:
                 type_label = TRX_FIELD_TYPES[field]
-                trx_row[field] = generate_trx_value(field, type_label, is_fraud, i)
+                trx_row[field] = generate_trx_value(field, type_label, is_fraud, i, trx_context)
 
-            # Build ECM row (1:1 for now)
             ecm_row: Dict[str, Any] = {}
             for field in ecm_fields:
                 type_label = ECM_FIELD_TYPES[field]
-                ecm_row[field] = generate_ecm_value(field, type_label, trx_row, is_fraud)
+                ecm_row[field] = generate_ecm_value(field, type_label, trx_row, is_fraud, ecm_context)
 
-            # Write as JSON lines
             f_trx.write(json.dumps(trx_row, ensure_ascii=False) + "\n")
             f_ecm.write(json.dumps(ecm_row, ensure_ascii=False) + "\n")
 
+    observed_ratio = observed_fraud / n_transactions
     print(f"[INFO] Wrote transactions to: {trx_path}")
     print(f"[INFO] Wrote ECM records to:  {ecm_path}")
+    print(f"[INFO] Observed fraud rows: {observed_fraud} ({observed_ratio:.4%})")
 
 
 # ---------------------------------------------------------------------------

@@ -43,7 +43,7 @@ from typing import List, Tuple, Dict, Optional, Any
 import numpy as np
 import pandas as pd
 
-from sklearn.model_selection import train_test_split, StratifiedKFold, GridSearchCV, cross_val_score
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     roc_auc_score,
     average_precision_score,
@@ -149,6 +149,59 @@ class Config:
     rf_warm_start_chunk: int = 50
     rf_n_jobs: int = -1
 
+    # Encoding / feature controls
+    target_encode_whitelist: Tuple[str, ...] = tuple(
+        (
+            "CITY_OR_LOCATION_NAME IP_COUNTRY_CD IP_REGION_NAME IP_REGION_CD "
+            "PRODUCT_CD SUBPRODUCT_CD CURRENCY_CD TRX_ORIGIN_CD TRX_GROUP_CD "
+            "DEVICE_OPERATING_SYSTEM_NO OS_NAME LANGUAGE_CD "
+            "CUSTOMER_SEGMENT_NAME PROFESSION_NAME ECONOMIC_NAME "
+            "DESTINATION_COUNTRY_CD DESTINATION_ENTITY_NAME TARGET_BANK_CD "
+            "DESTINATION_PRODUCT_TYPE_CD LOCAL_OR_INTERNATIONAL_CD "
+            "CLIENT_RIM_TARGET_CD"
+        ).split()
+    )
+    id_like_cols: Tuple[str, ...] = tuple(
+        (
+            "SOURCE_ID CORRELATIVE_NO SESSION_ID GUID_NRO SERIAL_NRO "
+            "RESULTING_DBFD_GUID_DESC REFERENCE_NO SERVICE_PAYMENT_REF_3_NO "
+            "SERVICE_PAYMENT_REF_4_NO COOKIE_TEXT LOCAL_STORAGE_VALUE_TEXT "
+            "RESULTING_REGISTRATION_CD HASHINTEGRITY_NO USER_DEVICE_PATTERN_DDS_NO "
+            "DEVICE_NO MACADDRESS_NO IMEI_NO"
+        ).split()
+    )
+
+    # Date parsing
+    date_cols: Tuple[str, ...] = tuple(
+        (
+            "AUDIT_DT LAST_UPD_DT TRANSACTION_DT_TIME TRX_DT "
+            "LAST_MOVEMENT_ACCOUNT_DATE ACCOUNT_OPENING_DATE CUSTOMER_BONDING_DATE "
+            "DST_ACC_OP_DATE CLOSING_DATE"
+        ).split()
+    )
+    int_date_cols: Tuple[str, ...] = tuple(
+        (
+            "TRX_DATE TRANSACTION_DT SEND_DATE RECEPTION_DATE CONS_MASIVIAN_DATE "
+            "RESPONSE_MASIVIAN_DATE LAST_UP_DATE LAST_CONNECTION_JUMP_DATE "
+            "LAST_REF_PAYMENT_DATE BIRTH_DATE"
+        ).split()
+    )
+
+    def entity_columns(self) -> Tuple[str, ...]:
+        return tuple(
+            c
+            for c in [
+                self.customer_col,
+                self.account_col,
+                self.dest_account_col,
+                self.device_col,
+                self.ip_col,
+                self.phone_col,
+                self.email_col,
+            ]
+            if c
+        )
+
 
 def _parse_bool_env(value: str) -> bool:
     val = value.strip().lower()
@@ -204,9 +257,8 @@ def seed_everything(seed: int = 42) -> None:
 
 
 def safe_parse_date(series: pd.Series) -> pd.Series:
-    """Best-effort parse of a date-like series to datetime.date."""
-    parsed = pd.to_datetime(series, errors="coerce")
-    return parsed.dt.date
+    """Best-effort parse of a date-like series to pandas datetime."""
+    return pd.to_datetime(series, errors="coerce")
 
 
 def safe_parse_int(series: pd.Series) -> pd.Series:
@@ -217,6 +269,13 @@ def safe_parse_int(series: pd.Series) -> pd.Series:
 def safe_parse_float(series: pd.Series) -> pd.Series:
     """Coerce to floats; invalid -> NaN."""
     return pd.to_numeric(series, errors="coerce").astype("float64")
+
+
+def parse_int_yyyymmdd(series: pd.Series) -> pd.Series:
+    """Parse integer-coded YYYYMMDD values into pandas datetime."""
+    numeric = pd.to_numeric(series, errors="coerce").astype("Int64")
+    string_values = numeric.astype(str).replace("<NA>", np.nan)
+    return pd.to_datetime(string_values, format="%Y%m%d", errors="coerce")
 
 
 def make_data_messy(
@@ -350,19 +409,28 @@ def clean_and_normalize_raw(
     df_trx = df_trx.copy()
     df_ecm = df_ecm.copy()
 
-    # Normalize transaction date/hour
-    if cfg.trx_date_col in df_trx.columns:
-        df_trx[cfg.trx_date_col] = safe_parse_date(df_trx[cfg.trx_date_col])
+    # Normalize transaction hour
     if cfg.trx_hour_col in df_trx.columns:
         df_trx[cfg.trx_hour_col] = safe_parse_int(df_trx[cfg.trx_hour_col])
+
+    # Parse known datetime columns (string-coded)
+    date_cols = set(cfg.date_cols)
+    int_date_cols = set(cfg.int_date_cols)
+    for col in date_cols:
+        if col in df_trx.columns:
+            df_trx[col] = safe_parse_date(df_trx[col])
+        if col in df_ecm.columns:
+            df_ecm[col] = safe_parse_date(df_ecm[col])
+    for col in int_date_cols:
+        if col in df_trx.columns:
+            df_trx[col] = parse_int_yyyymmdd(df_trx[col])
+        if col in df_ecm.columns:
+            df_ecm[col] = parse_int_yyyymmdd(df_ecm[col])
 
     # Normalize amount
     if cfg.trx_amount_col in df_trx.columns:
         df_trx[cfg.trx_amount_col] = safe_parse_float(df_trx[cfg.trx_amount_col])
 
-    # Normalize ECM closing date/hour if present (not strictly needed here)
-    if "CLOSING_DATE" in df_ecm.columns:
-        df_ecm["CLOSING_DATE"] = safe_parse_date(df_ecm["CLOSING_DATE"])
     if "CLOSING_HOUR" in df_ecm.columns:
         df_ecm["CLOSING_HOUR"] = safe_parse_int(df_ecm["CLOSING_HOUR"])
 
@@ -610,27 +678,51 @@ def split_train_val_test(
 # ------------------------------------------------------------------------------
 
 def add_time_features(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
-    """Add simple time-based features if date/hour columns are present."""
+    """Add time-based and recency features extracted from parsed datetime columns."""
     df = df.copy()
 
+    trx_dt = None
     if cfg.trx_date_col in df.columns:
-        date_parsed = pd.to_datetime(df[cfg.trx_date_col], errors="coerce")
-        df["TRX_DAYOFWEEK"] = date_parsed.dt.dayofweek
-        df["TRX_DAY"] = date_parsed.dt.day
-        df["TRX_MONTH"] = date_parsed.dt.month
+        trx_dt = pd.to_datetime(df[cfg.trx_date_col], errors="coerce")
+        df["TRX_DAYOFWEEK"] = trx_dt.dt.dayofweek
+        df["TRX_DAY"] = trx_dt.dt.day
+        df["TRX_MONTH"] = trx_dt.dt.month
+        df["TRX_YEAR"] = trx_dt.dt.year
+
     if cfg.trx_hour_col in df.columns:
         hour = pd.to_numeric(df[cfg.trx_hour_col], errors="coerce")
         df["TRX_HOUR_CLEAN"] = hour
-        night_mask = (hour >= 0) & (hour <= 6)
+        night_mask = (hour >= 0) & ((hour <= 6) | (hour >= 23))
         df["TRX_IS_NIGHT"] = night_mask.fillna(False).astype(int)
-        df["TRX_IS_WEEKEND"] = 0
         if "TRX_DAYOFWEEK" in df.columns:
             weekend_mask = df["TRX_DAYOFWEEK"].isin([5, 6])
             df["TRX_IS_WEEKEND"] = weekend_mask.fillna(False).astype(int)
+        elif trx_dt is not None:
+            weekend_mask = trx_dt.dt.dayofweek.isin([5, 6])
+            df["TRX_IS_WEEKEND"] = weekend_mask.fillna(False).astype(int)
+        else:
+            df["TRX_IS_WEEKEND"] = 0
 
     if cfg.trx_amount_col in df.columns:
         amount = pd.to_numeric(df[cfg.trx_amount_col], errors="coerce")
         df["TRX_AMOUNT_LOG"] = np.log1p(amount.clip(lower=0))
+
+    # Additional known dates (account opening, last update, etc.)
+    additional_dates = (set(cfg.date_cols) | set(cfg.int_date_cols)) - {cfg.trx_date_col}
+    for col in additional_dates:
+        if col not in df.columns:
+            continue
+        parsed = pd.to_datetime(df[col], errors="coerce")
+        df[f"{col}_YEAR"] = parsed.dt.year
+        df[f"{col}_MONTH"] = parsed.dt.month
+        df[f"{col}_DAY"] = parsed.dt.day
+        if trx_dt is not None:
+            delta = (trx_dt - parsed).dt.days
+            df[f"DAYS_SINCE_{col}"] = delta
+
+    if "TRX_IS_WEEKEND" not in df.columns and trx_dt is not None:
+        weekend_mask = trx_dt.dt.dayofweek.isin([5, 6])
+        df["TRX_IS_WEEKEND"] = weekend_mask.fillna(False).astype(int)
 
     return df
 
@@ -1000,9 +1092,20 @@ def build_feature_matrix(
         cfg.trx_id_col,
     }
 
+    entity_cols = set(cfg.entity_columns())
+    id_like_cols = set(cfg.id_like_cols)
+    parsed_date_cols = set(cfg.date_cols) | set(cfg.int_date_cols)
+    drop_cols = entity_cols | id_like_cols | parsed_date_cols
+
     # Identify candidate feature columns
     all_cols = list(train_fe.columns)
-    feature_cols = [c for c in all_cols if c not in exclude_cols]
+    feature_cols = [c for c in all_cols if c not in exclude_cols and c not in drop_cols]
+    drop_count = len(drop_cols & set(all_cols))
+    if drop_count:
+        logger.info(
+            "Excluding %d raw ID/entity/date columns from model features",
+            drop_count,
+        )
 
     # Identify numeric vs categorical
     numeric_cols: List[str] = []
@@ -1018,8 +1121,21 @@ def build_feature_matrix(
         train_fe, categorical_cols, low_card_threshold=50, high_card_threshold=500
     )
 
-    # Combine medium + high cardinality columns for target encoding
-    target_encode_cols = med_card_target + high_card_target
+    whitelist = set(cfg.target_encode_whitelist)
+    candidate_target_cols = med_card_target + high_card_target
+    target_encode_cols = [
+        c for c in candidate_target_cols
+        if c in whitelist and c not in entity_cols
+    ]
+    dropped_high_card = sorted(set(candidate_target_cols) - set(target_encode_cols))
+    if dropped_high_card:
+        logger.info(
+            "Skipping target encoding for %d high-cardinality columns (ID-like or not whitelisted)",
+            len(dropped_high_card),
+        )
+        for col in dropped_high_card[:5]:
+            logger.info("    - %s", col)
+    feature_cols = [c for c in feature_cols if c not in dropped_high_card]
 
     logger.info(f"  Numeric feature columns: {len(numeric_cols)}")
     logger.info(f"  Low cardinality categorical (OHE): {len(low_card_ohe)}")
@@ -1041,7 +1157,7 @@ def build_feature_matrix(
     # (target-encoded columns are added, original high-cardinality columns are dropped)
     feature_cols = [
         c for c in train_fe.columns
-        if c not in exclude_cols and c not in target_encode_cols
+        if c not in exclude_cols and c not in target_encode_cols and c not in drop_cols
     ]
 
     # Re-identify numeric vs categorical after target encoding
@@ -1758,38 +1874,41 @@ def train_lightgbm(
     logger.info(f"  Class weights: fraud={fraud_weight:.2f}, non-fraud=1.0 (auto-balanced)")
 
     lgbm = LGBMClassifier(
-        n_estimators=1000,
+        n_estimators=500,
         learning_rate=0.05,
-        num_leaves=31,
+        num_leaves=64,
         max_depth=-1,
         subsample=0.8,
         colsample_bytree=0.8,
-        reg_alpha=0.1,
-        reg_lambda=0.5,
-        min_child_samples=50,
+        reg_alpha=0.0,
+        reg_lambda=1.0,
+        min_child_samples=40,
         objective="binary",
-        class_weight="balanced",  # Automatically balance class weights
+        class_weight="balanced",
         random_state=cfg.random_state,
         n_jobs=-1,
-        verbose=-1,  # Suppress verbose output
+        verbose=-1,
     )
 
+    callbacks = []
     try:
-        # Try newer LightGBM API with callbacks
         from lightgbm import early_stopping
-        logger.info("Using LightGBM early stopping with callbacks API")
-        lgbm.fit(
-            X_train,
-            y_train,
-            eval_set=[(X_val, y_val)],
-            eval_metric="auc",
-            callbacks=[early_stopping(50, verbose=False)],
-        )
-        logger.info(f"LightGBM best iteration: {lgbm.best_iteration_}")
-    except (ImportError, TypeError) as e1:
-        # Fallback to older API or direct fit without early stopping
-        logger.info(f"Newer LightGBM API not available ({type(e1).__name__}); using older API")
-        try:
+
+        callbacks.append(early_stopping(stopping_rounds=50))
+        logger.info("Using LightGBM callbacks API for early stopping (50 rounds)")
+    except (ImportError, TypeError):
+        logger.info("LightGBM callback early stopping unavailable; trying legacy API")
+
+    try:
+        if callbacks:
+            lgbm.fit(
+                X_train,
+                y_train,
+                eval_set=[(X_val, y_val)],
+                eval_metric="auc",
+                callbacks=callbacks,
+            )
+        else:
             lgbm.fit(
                 X_train,
                 y_train,
@@ -1797,69 +1916,13 @@ def train_lightgbm(
                 eval_metric="auc",
                 early_stopping_rounds=50,
             )
-            logger.info(f"LightGBM best iteration: {lgbm.best_iteration_}")
-        except TypeError as e2:
-            # If early_stopping_rounds not supported, train without it
-            logger.warning(f"Early stopping not supported ({e2}); training without early stopping")
-            try:
-                lgbm.fit(X_train, y_train)
-                logger.info(f"LightGBM training completed ({lgbm.n_estimators_} iterations)")
-            except TypeError as e3:
-                logger.error(f"LightGBM fit failed ({e3}); skipping model")
-                return None
+        if hasattr(lgbm, "best_iteration_") and lgbm.best_iteration_ is not None:
+            logger.info("LightGBM best iteration: %s", lgbm.best_iteration_)
+    except TypeError:
+        logger.warning("Early stopping arguments unsupported; training LightGBM without it")
+        lgbm.fit(X_train, y_train)
 
     return lgbm
-
-
-def tune_xgboost_params(X: np.ndarray, y: np.ndarray, sample_size: int = 5000, cv_splits: int = 3) -> Dict[str, Any]:
-    """
-    Perform grid search with cross-validation to find best hyperparameters for XGBoost.
-    Uses a random sample of the training data (up to sample_size) for efficiency.
-
-    Args:
-        X: Training feature matrix
-        y: Training labels
-        sample_size: Maximum number of samples to use for tuning (default 5000)
-        cv_splits: Number of cross-validation splits (default 3)
-
-    Returns:
-        Dictionary of best hyperparameters found during grid search
-    """
-    X_sample, y_sample = X, y
-    if len(y) > sample_size:
-        rng = np.random.RandomState(42)
-        indices = rng.choice(len(y), size=sample_size, replace=False)
-        X_sample = X[indices]
-        y_sample = y[indices]
-
-    param_grid = {
-        "max_depth": [3, 4, 5, 6],
-        "gamma": [0.5, 1, 2],
-        "min_child_weight": [100],
-        "subsample": [0.6, 0.8, 1.0],
-        "colsample_bytree": [0.6, 0.8, 1.0],
-        "learning_rate": [0.1, 0.01],
-    }
-    xgb_est = XGBClassifier(
-        objective="binary:logistic",
-        eval_metric="auc",
-        n_estimators=100,
-        n_jobs=-1,
-        random_state=42,
-    )
-    cv = StratifiedKFold(n_splits=cv_splits, shuffle=True, random_state=42)
-    grid_search = GridSearchCV(
-        estimator=xgb_est,
-        param_grid=param_grid,
-        scoring="roc_auc",
-        cv=cv,
-        n_jobs=-1,
-        verbose=1
-    )
-    logger.info("Starting XGBoost hyperparameter tuning with GridSearchCV...")
-    grid_search.fit(X_sample, y_sample)
-    logger.info(f"Best XGBoost params: {grid_search.best_params_} | Best CV AUC: {grid_search.best_score_:.4f}")
-    return grid_search.best_params_
 
 
 def train_xgboost(
@@ -1870,22 +1933,15 @@ def train_xgboost(
     cfg: Config,
 ):
     """
-    Train an XGBoost binary classifier with IBM-style hyperparameter tuning,
-    early stopping, class weighting, and regularization.
-
-    Enhanced features:
-    - GridSearchCV hyperparameter tuning on training data
-    - Scale_pos_weight for class imbalance handling
-    - Early stopping based on validation AUC
-    - Adaptive learning rates and tree depth based on data characteristics
-    - Comprehensive logging and monitoring
+    Train an XGBoost binary classifier with a sane default configuration,
+    class weighting, and validation-based early stopping.
     """
     if XGBClassifier is None:
         logger.warning("XGBoost not installed; skipping XGBoost model.")
         return None
 
     logger.info("=" * 70)
-    logger.info("Training XGBoostClassifier with IBM-style hyperparameter tuning")
+    logger.info("Training XGBoostClassifier with balanced class weights (no grid search)")
 
     # Compute class weights for XGBoost
     n_fraud = (y_train == 1).sum()
@@ -1893,72 +1949,39 @@ def train_xgboost(
     scale_pos_weight = n_non_fraud / (n_fraud + 1e-8) if n_fraud > 0 else 1.0
     logger.info(f"  Class imbalance ratio (scale_pos_weight): {scale_pos_weight:.2f}")
 
-    # Step 1: Hyperparameter tuning via GridSearchCV
-    logger.info("Step 1: Hyperparameter tuning via GridSearchCV")
-    best_params = tune_xgboost_params(X_train, y_train)
+    xgb = XGBClassifier(
+        n_estimators=500,
+        learning_rate=0.05,
+        max_depth=6,
+        min_child_weight=10,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        gamma=0.0,
+        reg_alpha=0.0,
+        reg_lambda=1.0,
+        objective="binary:logistic",
+        eval_metric="auc",
+        tree_method="hist",
+        n_jobs=-1,
+        scale_pos_weight=max(1.0, scale_pos_weight),
+        random_state=cfg.random_state,
+    )
 
-    # Step 2: Build final model with best parameters and class weighting
-    logger.info("Step 2: Building final model with best parameters")
-    xgb_params = {
-        "objective": "binary:logistic",
-        "eval_metric": "auc",
-        "n_jobs": -1,
-        "scale_pos_weight": scale_pos_weight,  # Handle class imbalance
-        "random_state": cfg.random_state,
-        **best_params,
-    }
-
-    xgb = XGBClassifier(n_estimators=1000, **xgb_params)
-
-    # Step 3: Train with early stopping
-    logger.info("Step 3: Training XGBoost with early stopping on validation set")
+    logger.info("Training XGBoost with early stopping on validation set (50 rounds)")
     try:
-        # Try XGBoost 2.1+ callback API (xgboost.callback.EarlyStopping)
-        try:
-            from xgboost.callback import EarlyStopping
-            logger.info("Using XGBoost 2.1+ EarlyStopping callback API")
-            xgb.fit(
-                X_train,
-                y_train,
-                eval_set=[(X_val, y_val)],
-                callbacks=[EarlyStopping(rounds=50, metric_name='logloss')],
-                verbose=False
-            )
-        except (ImportError, AttributeError, TypeError) as e_new:
-            # Try alternative XGBoost 2.0 import
-            try:
-                from xgboost import early_stopping
-                logger.info("Using XGBoost 2.0 early_stopping callback API")
-                xgb.fit(
-                    X_train,
-                    y_train,
-                    eval_set=[(X_val, y_val)],
-                    callbacks=[early_stopping(rounds=50, metric_name='logloss')],
-                    verbose=False
-                )
-            except (ImportError, TypeError, AttributeError) as e_alt:
-                # Fallback: Train without early stopping (just use eval_set for monitoring)
-                logger.warning(f"Early stopping callback not available; training without early stopping")
-                logger.info(f"XGBoost version detection note: tried 2.1+ and 2.0 callback APIs")
-                xgb.fit(
-                    X_train,
-                    y_train,
-                    eval_set=[(X_val, y_val)],
-                    verbose=False
-                )
-
-        # Log training completion
-        if hasattr(xgb, 'best_iteration'):
-            logger.info(
-                f"XGBoost training complete: best iteration={xgb.best_iteration} "
-                f"with val AUC={xgb.best_score:.4f}"
-            )
-        else:
-            logger.info(f"XGBoost training complete with {xgb.n_estimators} estimators")
+        xgb.fit(
+            X_train,
+            y_train,
+            eval_set=[(X_val, y_val)],
+            early_stopping_rounds=50,
+            verbose=False,
+        )
+        if hasattr(xgb, "best_iteration") and xgb.best_iteration is not None:
+            logger.info("XGBoost best_iteration=%s", xgb.best_iteration)
 
     except Exception as e:
-        logger.error(f"XGBoost training failed: {e}", exc_info=True)
-        return None
+        logger.warning("Early stopping API failed (%s); training XGBoost without it", e)
+        xgb.fit(X_train, y_train)
 
     return xgb
 
@@ -2012,15 +2035,9 @@ def run_pipeline(cfg: Config) -> Dict[str, Dict[str, Any]]:
         preprocess_pipeline,
     ) = build_feature_matrix(train_fe, val_fe, test_fe, cfg)
 
-    # 8. Apply SMOTE ONLY to training set (not validation or test)
-    # IMPORTANT: Validation and test sets stay PURE (original temporal split data)
-    # This allows realistic evaluation on real fraud patterns, not synthetic ones
-    # Benefits:
-    # - Validation metrics reflect real fraud detection capability
-    # - No overfitting to synthetic fraud patterns (common pitfall)
-    # - Test set remains uncontaminated for final evaluation
-    # - Standard ML best practice: resample only training, validate/test on original data
-    X_train_res, y_train_res = resample_training_data(X_train, y_train, cfg)
+    # 8. Apply SMOTE ONLY for RandomForest; boosting models stay on original distribution
+    X_train_rf, y_train_rf = resample_training_data(X_train, y_train, cfg)
+    X_train_boost, y_train_boost = X_train, y_train
 
     # Extract feature names for importance analysis and explainability
     preprocessor = preprocess_pipeline.named_steps["preprocessor"]
@@ -2046,7 +2063,7 @@ def run_pipeline(cfg: Config) -> Dict[str, Dict[str, Any]]:
 
     # 9. Train & evaluate RandomForest
     logger.info("\n[TRAIN] RandomForest Model")
-    rf = train_random_forest(X_train_res, y_train_res, X_val, y_val, cfg)
+    rf = train_random_forest(X_train_rf, y_train_rf, X_val, y_val, cfg)
     rf_metrics = evaluate_model(
         "RandomForest",
         rf,
@@ -2061,7 +2078,7 @@ def run_pipeline(cfg: Config) -> Dict[str, Dict[str, Any]]:
 
     # 10. Train & evaluate LightGBM
     logger.info("\n[TRAIN] LightGBM Model")
-    lgbm = train_lightgbm(X_train_res, y_train_res, X_val, y_val, cfg)
+    lgbm = train_lightgbm(X_train_boost, y_train_boost, X_val, y_val, cfg)
     if lgbm is not None:
         lgbm_metrics = evaluate_model(
             "LightGBM",
@@ -2077,7 +2094,7 @@ def run_pipeline(cfg: Config) -> Dict[str, Dict[str, Any]]:
 
     # 11. Train & evaluate XGBoost
     logger.info("\n[TRAIN] XGBoost Model")
-    xgb = train_xgboost(X_train_res, y_train_res, X_val, y_val, cfg)
+    xgb = train_xgboost(X_train_boost, y_train_boost, X_val, y_val, cfg)
     if xgb is not None:
         xgb_metrics = evaluate_model(
             "XGBoost",

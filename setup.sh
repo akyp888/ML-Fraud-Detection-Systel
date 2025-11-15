@@ -47,7 +47,7 @@ cat <<'EOF'
 
 ✅ Environment ready!
 Activate it later with:
-  source local_run_with_sample_Data/.venv/bin/activate
+  source .venv/bin/activate
 
 Run the TechM pipeline with:
   cd local_run_with_sample_Data
