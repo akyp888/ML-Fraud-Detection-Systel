@@ -52,6 +52,7 @@ from sklearn.metrics import (
     confusion_matrix,
     precision_score,
     recall_score,
+    roc_curve,
 )
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
@@ -59,6 +60,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_selection import SelectFromModel, mutual_info_classif
+from sklearn.calibration import CalibratedClassifierCV
 
 # Optional dependencies --------------------------------------------------------
 try:
@@ -132,7 +134,27 @@ class Config:
     top_k_frac: float = 0.01     # precision@top 1% of scores
     threshold_metric: str = "f_beta"  # which metric find_best_threshold optimizes
 
-    # Imbalance handling
+    # Threshold strategy / business constraints
+    # "metric": optimize cfg.threshold_metric (F_beta etc.)
+    # "cost":   minimize expected cost given fn_cost / fp_cost
+    # "volume": fix alert volume via cfg.target_alert_rate
+    threshold_strategy: str = "metric"
+    fn_cost: float = 10.0
+    fp_cost: float = 1.0
+    target_alert_rate: Optional[float] = None  # e.g. 0.005 for 0.5% of tx flagged
+
+    # Probability calibration
+    use_probability_calibration: bool = False
+    calibration_method: str = "sigmoid"  # "sigmoid" (Platt) or "isotonic"
+
+    # Real world prevalence + training sampling for ultra-rare fraud
+    # real_fraud_rate can be set from actual Scotiabank rate (~0.00037 or similar)
+    real_fraud_rate: Optional[float] = None
+    # We deliberately oversample fraud in TRAIN ONLY to this rate
+    train_target_fraud_rate: float = 0.02  # 2% fraud in training sample
+    max_nonfraud_train: Optional[int] = None  # hard cap on non-fraud rows in train
+
+    # Imbalance handling (synthetic oversampling on top of downsampling)
     use_smote_tomek: bool = False
     smote_kind: str = "borderline"  # or "regular"
 
@@ -286,10 +308,7 @@ def make_data_messy(
     """
     Intentionally inject noise and messiness into the data to stress-test the pipeline.
 
-    - Randomly drop some values to create missingness
-    - Perturb transaction amounts
-    - Mutate category strings (new/unknown categories, random casing)
-    - Duplicate a few rows to simulate duplicates
+    (Currently not used in run_pipeline; kept for experimentation.)
     """
 
     df_trx = df_trx.copy()
@@ -488,7 +507,9 @@ def merge_trx_and_ecm(
     if "FRAUD_IND" in merged.columns:
         # Use the true fraud indicator from transactions (not corrupted by make_data_messy)
         label_series = merged["FRAUD_IND"].astype(str).str.strip()
-        merged[cfg.label_col] = np.where(label_series.isin(["1", "true", "True", "TRUE"]), 1, 0)
+        merged[cfg.label_col] = np.where(
+            label_series.isin(["1", "true", "True", "TRUE"]), 1, 0
+        )
     elif cfg.ecm_label_col in merged.columns:
         # Fallback to ECM label if FRAUD_IND not available
         label_series = merged[cfg.ecm_label_col].astype(str).str.upper().str.strip()
@@ -550,7 +571,6 @@ def split_train_val_test(
         df = df.sort_values(cfg.trx_date_col)
 
         # Stratified temporal: preserve fraud ratio in each temporal bucket
-        # Split by fraud status first, then apply temporal split within each group
         fraud_mask = df[cfg.label_col] == 1
         fraud_df = df[fraud_mask].sort_values(cfg.trx_date_col)
         non_fraud_df = df[~fraud_mask].sort_values(cfg.trx_date_col)
@@ -568,19 +588,22 @@ def split_train_val_test(
 
         # Split fraud and non-fraud temporally
         train_fraud = fraud_df.iloc[:n_train_fraud]
-        val_fraud = fraud_df.iloc[n_train_fraud : n_train_fraud + n_val_fraud]
-        test_fraud = fraud_df.iloc[n_train_fraud + n_val_fraud :]
+        val_fraud = fraud_df.iloc[n_train_fraud: n_train_fraud + n_val_fraud]
+        test_fraud = fraud_df.iloc[n_train_fraud + n_val_fraud:]
 
         train_non_fraud = non_fraud_df.iloc[:n_train_non_fraud]
-        val_non_fraud = non_fraud_df.iloc[n_train_non_fraud : n_train_non_fraud + n_val_non_fraud]
-        test_non_fraud = non_fraud_df.iloc[n_train_non_fraud + n_val_non_fraud :]
+        val_non_fraud = non_fraud_df.iloc[n_train_non_fraud: n_train_non_fraud + n_val_non_fraud]
+        test_non_fraud = non_fraud_df.iloc[n_train_non_fraud + n_val_non_fraud:]
 
         # Combine fraud and non-fraud
         train = pd.concat([train_fraud, train_non_fraud], ignore_index=True)
         val = pd.concat([val_fraud, val_non_fraud], ignore_index=True)
         test = pd.concat([test_fraud, test_non_fraud], ignore_index=True)
 
-        logger.info(f"  Stratified temporal split: fraud split as {n_train_fraud}/{n_val_fraud}/{len(test_fraud)}")
+        logger.info(
+            f"  Stratified temporal split: fraud split as "
+            f"{n_train_fraud}/{n_val_fraud}/{len(test_fraud)}"
+        )
     else:
         logger.info("Using stratified random split (no TRX_DATE available)")
         train_val, test = train_test_split(
@@ -609,7 +632,8 @@ def split_train_val_test(
     # Handle case where any split has 0 fraud
     if total_fraud > 0 and (train_fraud == 0 or val_fraud == 0 or test_fraud == 0):
         logger.warning(
-            f"Imbalanced fraud distribution: train={train_fraud}, val={val_fraud}, test={test_fraud}"
+            f"Imbalanced fraud distribution: train={train_fraud}, "
+            f"val={val_fraud}, test={test_fraud}"
         )
         logger.warning("Rebalancing splits to ensure each has at least 1 fraud case...")
 
@@ -626,50 +650,145 @@ def split_train_val_test(
         if available_fraud >= required_fraud:
             # Distribute fraud evenly
             fraud_train_count = max(min_fraud_per_split, available_fraud // 3)
-            fraud_val_count = max(min_fraud_per_split, (available_fraud - fraud_train_count) // 2)
+            fraud_val_count = max(
+                min_fraud_per_split, (available_fraud - fraud_train_count) // 2
+            )
             fraud_test_count = available_fraud - fraud_train_count - fraud_val_count
 
             # Randomly distribute fraud cases
-            fraud_indices = np.random.RandomState(cfg.random_state).permutation(available_fraud)
+            fraud_indices = np.random.RandomState(cfg.random_state).permutation(
+                available_fraud
+            )
             fraud_train_idx = fraud_indices[:fraud_train_count]
-            fraud_val_idx = fraud_indices[fraud_train_count : fraud_train_count + fraud_val_count]
-            fraud_test_idx = fraud_indices[fraud_train_count + fraud_val_count :]
+            fraud_val_idx = fraud_indices[
+                fraud_train_count: fraud_train_count + fraud_val_count
+            ]
+            fraud_test_idx = fraud_indices[fraud_train_count + fraud_val_count:]
 
             # Distribute non-fraud proportionally
             available_non_fraud = len(non_fraud_cases)
-            non_fraud_train_count = int((available_non_fraud) * 0.70)
-            non_fraud_val_count = int((available_non_fraud) * 0.15)
-            non_fraud_test_count = available_non_fraud - non_fraud_train_count - non_fraud_val_count
+            non_fraud_train_count = int(available_non_fraud * 0.70)
+            non_fraud_val_count = int(available_non_fraud * 0.15)
+            non_fraud_test_count = (
+                available_non_fraud - non_fraud_train_count - non_fraud_val_count
+            )
 
-            non_fraud_indices = np.random.RandomState(cfg.random_state).permutation(available_non_fraud)
+            non_fraud_indices = np.random.RandomState(
+                cfg.random_state
+            ).permutation(available_non_fraud)
             non_fraud_train_idx = non_fraud_indices[:non_fraud_train_count]
-            non_fraud_val_idx = non_fraud_indices[non_fraud_train_count : non_fraud_train_count + non_fraud_val_count]
-            non_fraud_test_idx = non_fraud_indices[non_fraud_train_count + non_fraud_val_count :]
+            non_fraud_val_idx = non_fraud_indices[
+                non_fraud_train_count: non_fraud_train_count + non_fraud_val_count
+            ]
+            non_fraud_test_idx = non_fraud_indices[
+                non_fraud_train_count + non_fraud_val_count:
+            ]
 
             # Reconstruct splits
             train = pd.concat(
                 [fraud_cases.iloc[fraud_train_idx], non_fraud_cases.iloc[non_fraud_train_idx]],
-                ignore_index=True
+                ignore_index=True,
             )
             val = pd.concat(
                 [fraud_cases.iloc[fraud_val_idx], non_fraud_cases.iloc[non_fraud_val_idx]],
-                ignore_index=True
+                ignore_index=True,
             )
             test = pd.concat(
                 [fraud_cases.iloc[fraud_test_idx], non_fraud_cases.iloc[non_fraud_test_idx]],
-                ignore_index=True
+                ignore_index=True,
             )
 
             logger.info(
-                f"Rebalanced split sizes: train={len(train)}, val={len(val)}, test={len(test)} "
-                f"(fraud in train={int(train[cfg.label_col].sum())}, "
-                f"fraud in val={int(val[cfg.label_col].sum())}, "
-                f"fraud in test={int(test[cfg.label_col].sum())})"
+                "Rebalanced split sizes: train=%d, val=%d, test=%d "
+                "(fraud in train=%d, fraud in val=%d, fraud in test=%d)",
+                len(train),
+                len(val),
+                len(test),
+                int(train[cfg.label_col].sum()),
+                int(val[cfg.label_col].sum()),
+                int(test[cfg.label_col].sum()),
             )
         else:
-            logger.warning(f"Very few fraud cases ({available_fraud}); cannot guarantee all splits have fraud")
+            logger.warning(
+                f"Very few fraud cases ({available_fraud}); cannot guarantee all splits have fraud"
+            )
 
     return train.reset_index(drop=True), val.reset_index(drop=True), test.reset_index(drop=True)
+
+
+# ------------------------------------------------------------------------------
+# Train sampling for ultra-rare fraud
+# ------------------------------------------------------------------------------
+
+def make_training_sample(
+    df: pd.DataFrame,
+    cfg: Config,
+) -> pd.DataFrame:
+    """
+    Construct a TRAINING sample by:
+      - keeping ALL fraud rows
+      - downsampling non-fraud rows to reach cfg.train_target_fraud_rate
+        (or to max_nonfraud_train, whichever is smaller).
+
+    This is applied ONLY on the training split; val/test keep natural prevalence.
+    """
+    label = cfg.label_col
+    if label not in df.columns:
+        raise KeyError(f"Label column '{label}' not found in training dataframe")
+
+    df = df.copy()
+    pos = df[df[label] == 1]
+    neg = df[df[label] == 0]
+
+    n_pos = len(pos)
+    n_neg = len(neg)
+    if n_pos == 0 or n_neg == 0:
+        logger.warning(
+            "make_training_sample: no positives or no negatives in train; "
+            "skipping downsampling."
+        )
+        return df
+
+    orig_rate = n_pos / (n_pos + n_neg + 1e-9)
+    target_rate = cfg.train_target_fraud_rate
+    if target_rate <= 0 or target_rate >= 0.5:
+        logger.info(
+            "train_target_fraud_rate=%.4f is out of (0, 0.5); skipping train downsampling",
+            target_rate,
+        )
+        return df
+
+    # Solve target_rate = n_pos / (n_pos + n_neg_sample)
+    target_neg = int(n_pos * (1.0 - target_rate) / target_rate)
+    if cfg.max_nonfraud_train is not None:
+        target_neg = min(target_neg, cfg.max_nonfraud_train)
+
+    target_neg = min(target_neg, n_neg)
+    if target_neg <= 0:
+        logger.warning("make_training_sample: computed target_neg <= 0; skipping")
+        return df
+
+    neg_sample = neg.sample(n=target_neg, random_state=cfg.random_state)
+    df_sampled = pd.concat([pos, neg_sample], ignore_index=True)
+    df_sampled = df_sampled.sample(frac=1.0, random_state=cfg.random_state).reset_index(
+        drop=True
+    )
+
+    new_rate = len(pos) / (len(df_sampled) + 1e-9)
+    logger.info(
+        "Training sampling: original n=%d (fraud=%d, non-fraud=%d, rate=%.6f) -> "
+        "sampled n=%d (fraud=%d, non-fraud=%d, rate=%.6f)",
+        len(df),
+        n_pos,
+        n_neg,
+        orig_rate,
+        len(df_sampled),
+        len(pos),
+        len(neg_sample),
+        new_rate,
+    )
+
+    return df_sampled
 
 
 # ------------------------------------------------------------------------------
@@ -763,7 +882,9 @@ def compute_entity_fraud_stats(
             continue
         grouped = train.groupby(col)[cfg.label_col].agg(["sum", "count"]).reset_index()
         grouped.columns = [col, "FRAUD_COUNT", "TOTAL_COUNT"]
-        grouped["FRAUD_RATE"] = grouped["FRAUD_COUNT"] / grouped["TOTAL_COUNT"].clip(lower=1)
+        grouped["FRAUD_RATE"] = grouped["FRAUD_COUNT"] / grouped["TOTAL_COUNT"].clip(
+            lower=1
+        )
         grouped.rename(
             columns={
                 "FRAUD_COUNT": f"{col}_FRAUD_COUNT",
@@ -838,7 +959,7 @@ def engineer_features(
 
 
 # ------------------------------------------------------------------------------
-# Resampling on Encoded Numeric Data (Best Approach)
+# Resampling on Encoded Numeric Data (unused helper)
 # ------------------------------------------------------------------------------
 
 def resample_train_val_combined_after_encoding(
@@ -849,27 +970,8 @@ def resample_train_val_combined_after_encoding(
     cfg: Config,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    UNUSED helper kept for reference:
-    Apply SMOTE to combined train+val AFTER feature encoding (on numeric data only).
-
-    This is the best approach for extreme class imbalance because:
-    - Works on already-encoded numeric data (no categorical string issues)
-    - Standard production ML pipeline approach
-    - Handles unknown actual data characteristics (encoding is data-agnostic)
-    - Adaptive k_neighbors for extremely small minority classes
-
-    Steps:
-    1. Combine train + val encoded features and labels
-    2. Apply SMOTE + TomekLinks to create synthetic fraud cases (with adaptive k_neighbors)
-    3. Re-split combined resampled data back into train/val using original proportions
-    4. Return resampled X_train, X_val, y_train, y_val as numpy arrays
-
-    Adaptive k_neighbors strategy:
-    - Default SMOTE uses k_neighbors=5, which requires >= 6 minority samples
-    - For extreme imbalance (< 5 minority samples), adaptively reduce k_neighbors
-    - Falls back to pure SMOTE if SMOTETomek fails (no undersampling)
-
-    Note: Test set is NOT resampled (kept pure for final evaluation).
+    UNUSED helper kept for reference: Apply SMOTE to combined train+val AFTER
+    feature encoding (on numeric data only).
     """
     original_train_size = len(X_train)
     original_val_size = len(X_val)
@@ -897,8 +999,6 @@ def resample_train_val_combined_after_encoding(
 
     logger.info("  Applying SMOTE + TomekLinks to create synthetic fraud cases...")
     try:
-        # Adaptive k_neighbors: use min(5, n_minority - 1) to handle very small minority classes
-        # SMOTE default k_neighbors=5, but needs at least 1 for algorithm to work
         k_neighbors = max(1, min(5, n_minority - 1)) if n_minority > 1 else 1
         logger.info(f"    Using k_neighbors={k_neighbors} (adaptive for {n_minority} minority samples)")
 
@@ -916,16 +1016,21 @@ def resample_train_val_combined_after_encoding(
             return X_train, X_val, y_train, y_val
 
     new_total_size = len(X_resampled)
-    logger.info(f"  After SMOTE: {new_total_size} rows (created {new_total_size - total_size} synthetic fraud cases)")
     logger.info(
-        f"  Resampled fraud distribution: {int(y_resampled.sum())} fraud, {int((y_resampled == 0).sum())} non-fraud"
+        f"  After SMOTE: {new_total_size} rows "
+        f"(created {new_total_size - total_size} synthetic fraud cases)"
+    )
+    logger.info(
+        "  Resampled fraud distribution: %d fraud, %d non-fraud",
+        int(y_resampled.sum()),
+        int((y_resampled == 0).sum()),
     )
 
     # Shuffle resampled data before re-splitting
     shuffle_idx = np.random.RandomState(cfg.random_state).permutation(new_total_size)
     X_resampled = X_resampled[shuffle_idx]
     y_resampled = y_resampled[shuffle_idx]
-    logger.info(f"  Shuffled resampled data to distribute fraud cases evenly")
+    logger.info("  Shuffled resampled data to distribute fraud cases evenly")
 
     # Re-split back into train/val using original proportions
     train_fraction = original_train_size / total_size
@@ -937,10 +1042,11 @@ def resample_train_val_combined_after_encoding(
     y_val_resampled = y_resampled[split_point:]
 
     logger.info(
-        f"  Re-split: train={len(X_train_resampled)} "
-        f"(fraud={int(y_train_resampled.sum())}), "
-        f"val={len(X_val_resampled)} "
-        f"(fraud={int(y_val_resampled.sum())})"
+        "  Re-split: train=%d (fraud=%d), val=%d (fraud=%d)",
+        len(X_train_resampled),
+        int(y_train_resampled.sum()),
+        len(X_val_resampled),
+        int(y_val_resampled.sum()),
     )
 
     return X_train_resampled, X_val_resampled, y_train_resampled, y_val_resampled
@@ -992,14 +1098,23 @@ def analyze_column_cardinality(
         if len(low_card_ohe) > 5:
             logger.info(f"    ... and {len(low_card_ohe) - 5} more")
 
-    logger.info(f"  Medium cardinality (Target Encode, {low_card_threshold}-{high_card_threshold}): {len(med_card_target)} columns")
+    logger.info(
+        "  Medium cardinality (Target Encode, %d-%d): %d columns",
+        low_card_threshold,
+        high_card_threshold,
+        len(med_card_target),
+    )
     if med_card_target:
         for col in med_card_target[:5]:
             logger.info(f"    - {col}: {cardinality_report[col]} unique values")
         if len(med_card_target) > 5:
             logger.info(f"    ... and {len(med_card_target) - 5} more")
 
-    logger.info(f"  High cardinality (Target Encode, >{high_card_threshold}): {len(high_card_target)} columns")
+    logger.info(
+        "  High cardinality (Target Encode, >%d): %d columns",
+        high_card_threshold,
+        len(high_card_target),
+    )
     if high_card_target:
         for col in high_card_target[:5]:
             logger.info(f"    - {col}: {cardinality_report[col]} unique values")
@@ -1028,7 +1143,9 @@ def compute_target_encoding_stats(
         # Group by column and compute fraud rate
         grouped = train.groupby(col)[cfg.label_col].agg(["sum", "count"]).reset_index()
         grouped.columns = [col, "fraud_count", "total_count"]
-        grouped["FRAUD_RATE"] = grouped["fraud_count"] / grouped["total_count"].clip(lower=1)
+        grouped["FRAUD_RATE"] = grouped["fraud_count"] / grouped["total_count"].clip(
+            lower=1
+        )
 
         # Keep only column and fraud rate
         grouped = grouped[[col, "FRAUD_RATE"]].copy()
@@ -1126,7 +1243,8 @@ def build_feature_matrix(
     dropped_high_card = sorted(set(candidate_target_cols) - set(target_encode_cols))
     if dropped_high_card:
         logger.info(
-            "Skipping target encoding for %d high-cardinality columns (ID-like or not whitelisted)",
+            "Skipping target encoding for %d high-cardinality columns "
+            "(ID-like or not whitelisted)",
             len(dropped_high_card),
         )
         for col in dropped_high_card[:5]:
@@ -1185,10 +1303,7 @@ def build_feature_matrix(
     categorical_transformer = Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="most_frequent")),
-            (
-                "ohe",
-                OneHotEncoder(**ohe_kwargs),
-            ),
+            ("ohe", OneHotEncoder(**ohe_kwargs)),
         ]
     )
 
@@ -1224,8 +1339,10 @@ def build_feature_matrix(
     X_test_t = model_pipeline.transform(X_test)
 
     logger.info(
-        f"Feature matrix shapes: X_train={X_train_t.shape}, "
-        f"X_val={X_val_t.shape}, X_test={X_test_t.shape}"
+        "Feature matrix shapes: X_train=%s, X_val=%s, X_test=%s",
+        X_train_t.shape,
+        X_val_t.shape,
+        X_test_t.shape,
     )
 
     return (
@@ -1240,7 +1357,7 @@ def build_feature_matrix(
 
 
 # ------------------------------------------------------------------------------
-# Imbalance handling
+# Imbalance handling (synthetic oversampling)
 # ------------------------------------------------------------------------------
 
 def resample_training_data(
@@ -1252,21 +1369,22 @@ def resample_training_data(
     Apply advanced imbalance handling with adaptive k_neighbors for small minority classes.
 
     Preferred: SMOTE-Tomek with BorderlineSMOTE (focusing on decision boundary).
-    """
 
+    NOTE: This runs on top of the PRIOR downsampling of non-fraud in train.
+    """
     if not cfg.use_smote_tomek:
         logger.info("SMOTE-Tomek disabled via config; using original training data")
         return X_train, y_train
 
     n_minority = int(y_train.sum())
-    logger.info(f"Training data: {len(X_train)} total, {n_minority} fraud (minority)")
+    logger.info("Training data: %d total, %d fraud (minority)", len(X_train), n_minority)
 
     # Adaptive k_neighbors for extremely small minority classes
     k_neighbors = max(1, min(5, n_minority - 1)) if n_minority > 1 else 1
-    logger.info(f"Using adaptive k_neighbors={k_neighbors} (for {n_minority} minority samples)")
+    logger.info("Using adaptive k_neighbors=%d (for %d minority samples)", k_neighbors, n_minority)
 
     if n_minority < 2:
-        logger.warning(f"Very few fraud cases ({n_minority}); cannot apply SMOTE")
+        logger.warning("Very few fraud cases (%d); cannot apply SMOTE", n_minority)
         return X_train, y_train
 
     smote_kind = (cfg.smote_kind or "regular").lower()
@@ -1274,8 +1392,11 @@ def resample_training_data(
 
     def _log_and_return(X, y, desc: str):
         logger.info(
-            f"{desc} output: {X.shape}, fraud={int(y.sum())}, "
-            f"non-fraud={int((y == 0).sum())}"
+            "%s output: %s, fraud=%d, non-fraud=%d",
+            desc,
+            X.shape,
+            int(y.sum()),
+            int((y == 0).sum()),
         )
         return X, y
 
@@ -1295,21 +1416,35 @@ def resample_training_data(
                 fraud_after_tomek = int(y_clean.sum())
 
                 if fraud_after_tomek > n_minority:
-                    logger.info(f"✓ BorderlineSMOTE created {fraud_after_smote} fraud, TomekLinks refined to {fraud_after_tomek}")
+                    logger.info(
+                        "✓ BorderlineSMOTE created %d fraud, TomekLinks refined to %d",
+                        fraud_after_smote,
+                        fraud_after_tomek,
+                    )
                     return _log_and_return(X_clean, y_clean, "BorderlineSMOTE + TomekLinks")
                 else:
-                    logger.warning(f"TomekLinks removed too many samples ({fraud_after_tomek} fraud); skipping")
+                    logger.warning(
+                        "TomekLinks removed too many samples (%d fraud); skipping",
+                        fraud_after_tomek,
+                    )
                     return None
 
             if fraud_after_smote > n_minority:
-                logger.info(f"✓ BorderlineSMOTE created synthetic fraud: {n_minority} → {fraud_after_smote}")
+                logger.info(
+                    "✓ BorderlineSMOTE created synthetic fraud: %d → %d",
+                    n_minority,
+                    fraud_after_smote,
+                )
                 return _log_and_return(X_smote, y_smote, "BorderlineSMOTE")
             else:
-                logger.warning(f"BorderlineSMOTE output unchanged ({fraud_after_smote} fraud); need fallback")
+                logger.warning(
+                    "BorderlineSMOTE output unchanged (%d fraud); need fallback",
+                    fraud_after_smote,
+                )
                 return None
 
         except Exception as e:
-            logger.warning(f"BorderlineSMOTE failed ({e}); falling back to pure SMOTE")
+            logger.warning("BorderlineSMOTE failed (%s); falling back to pure SMOTE", e)
             return None
 
     if smote_kind == "borderline" and has_borderline:
@@ -1328,17 +1463,24 @@ def resample_training_data(
     # Fallback: Try pure SMOTE with k_neighbors=1
     try:
         smote_k = max(1, min(k_neighbors, 1))
-        logger.info(f"Applying pure SMOTE with k_neighbors={smote_k}...")
+        logger.info("Applying pure SMOTE with k_neighbors=%d...", smote_k)
         smote_estimator = SMOTE(k_neighbors=smote_k, random_state=cfg.random_state)
         X_res, y_res = smote_estimator.fit_resample(X_train, y_train)
         fraud_after = int(y_res.sum())
         if fraud_after > n_minority:
-            logger.info(f"✓ SMOTE successfully created synthetic fraud: {n_minority} → {fraud_after}")
+            logger.info(
+                "✓ SMOTE successfully created synthetic fraud: %d → %d",
+                n_minority,
+                fraud_after,
+            )
             return _log_and_return(X_res, y_res, "SMOTE")
         else:
-            logger.warning(f"SMOTE output unchanged ({fraud_after} fraud); trying RandomOverSampler")
+            logger.warning(
+                "SMOTE output unchanged (%d fraud); trying RandomOverSampler",
+                fraud_after,
+            )
     except Exception as e:
-        logger.warning(f"Pure SMOTE failed ({e}); trying RandomOverSampler as fallback")
+        logger.warning("Pure SMOTE failed (%s); trying RandomOverSampler as fallback", e)
 
     # Last resort: Simple random oversampling (duplicates minority samples)
     try:
@@ -1347,11 +1489,18 @@ def resample_training_data(
         sampler = RandomOverSampler(random_state=cfg.random_state)
         X_res, y_res = sampler.fit_resample(X_train, y_train)
         fraud_after = int(y_res.sum())
-        logger.info(f"✓ RandomOverSampler created duplicate fraud cases: {n_minority} → {fraud_after}")
+        logger.info(
+            "✓ RandomOverSampler created duplicate fraud cases: %d → %d",
+            n_minority,
+            fraud_after,
+        )
         return _log_and_return(X_res, y_res, "RandomOverSampler")
     except Exception as e:
-        logger.warning(f"RandomOverSampler failed ({e}); returning original training data")
-        logger.warning("WARNING: Model will train on original highly imbalanced data (no synthetic oversampling)!")
+        logger.warning("RandomOverSampler failed (%s); returning original training data", e)
+        logger.warning(
+            "WARNING: Model will train on original highly imbalanced data "
+            "(no synthetic oversampling)!"
+        )
         return X_train, y_train
 
 
@@ -1390,12 +1539,14 @@ def select_important_features(
     selected_names = [feature_names[i] for i, sel in enumerate(selected_mask) if sel]
 
     logger.info(
-        f"  Selected {len(selected_names)} / {len(feature_names)} features "
-        f"(reduction: {100 * (1 - len(selected_names) / len(feature_names)):.1f}%)"
+        "  Selected %d / %d features (reduction: %.1f%%)",
+        len(selected_names),
+        len(feature_names),
+        100 * (1 - len(selected_names) / len(feature_names)),
     )
-    logger.info(f"  Kept features: {selected_names[:10]}")
+    logger.info("  Kept features: %s", selected_names[:10])
     if len(selected_names) > 10:
-        logger.info(f"  ... and {len(selected_names) - 10} more")
+        logger.info("  ... and %d more", len(selected_names) - 10)
 
     return X_selected, selected_mask, selected_names
 
@@ -1409,18 +1560,21 @@ def compute_feature_importance(
     """
     Compute and rank feature importance from a trained model.
     """
-    logger.info(f"[STEP] Computing feature importance ({importance_type})")
+    logger.info("[STEP] Computing feature importance (%s)", importance_type)
+
+    # Unwrap calibrated models
+    inner_model = getattr(model, "base_estimator", model)
 
     importances = None
 
-    if hasattr(model, 'feature_importances_'):
-        importances = model.feature_importances_
-    elif hasattr(model, 'get_booster'):
-        booster = model.get_booster()
+    if hasattr(inner_model, "feature_importances_"):
+        importances = inner_model.feature_importances_
+    elif hasattr(inner_model, "get_booster"):
+        booster = inner_model.get_booster()
         importance_dict = booster.get_score(importance_type=importance_type)
         importances = np.zeros(len(feature_names))
         for feat_name, score in importance_dict.items():
-            if feat_name.startswith('f'):
+            if feat_name.startswith("f"):
                 try:
                     idx = int(feat_name[1:])
                     if idx < len(importances):
@@ -1432,14 +1586,13 @@ def compute_feature_importance(
         logger.warning("Could not compute feature importance; model type not supported")
         return pd.DataFrame()
 
-    importance_df = pd.DataFrame({
-        'feature': feature_names,
-        'importance': importances,
-    }).sort_values('importance', ascending=False)
+    importance_df = pd.DataFrame(
+        {"feature": feature_names, "importance": importances}
+    ).sort_values("importance", ascending=False)
 
-    logger.info(f"  Top {top_k} features:")
+    logger.info("  Top %d features:", top_k)
     for _, row in importance_df.head(top_k).iterrows():
-        logger.info(f"    {row['feature']}: {row['importance']:.6f}")
+        logger.info("    %s: %.6f", row["feature"], row["importance"])
 
     return importance_df
 
@@ -1458,12 +1611,17 @@ def explain_model_with_shap(
         logger.warning("SHAP not installed; skipping model explainability analysis")
         return None
 
-    logger.info(f"[STEP] Computing SHAP explanations for {model_name}")
+    logger.info("[STEP] Computing SHAP explanations for %s", model_name)
+
+    # Unwrap calibrated models to the underlying tree model
+    inner_model = getattr(model, "base_estimator", model)
 
     if len(X_sample) > max_samples:
         indices = np.random.choice(len(X_sample), max_samples, replace=False)
         X_explain = X_sample[indices]
-        logger.info(f"  Using {max_samples} samples for explanation (out of {len(X_sample)})")
+        logger.info(
+            "  Using %d samples for explanation (out of %d)", max_samples, len(X_sample)
+        )
     else:
         X_explain = X_sample
 
@@ -1471,24 +1629,26 @@ def explain_model_with_shap(
         n_background = min(100, len(X_sample) // 2)
         bg_indices = np.random.choice(len(X_sample), n_background, replace=False)
         X_background = X_sample[bg_indices]
-        logger.info(f"  Using {n_background} background samples for SHAP")
+        logger.info("  Using %d background samples for SHAP", n_background)
 
     try:
-        if hasattr(model, 'predict_proba'):
-            explainer = shap.TreeExplainer(model)
+        if hasattr(inner_model, "predict_proba"):
+            explainer = shap.TreeExplainer(inner_model)
             shap_values = explainer.shap_values(X_explain)
-            logger.info(f"  SHAP TreeExplainer created; computed {len(shap_values)} samples")
+            logger.info("  SHAP TreeExplainer created; computed %d samples", len(shap_values))
         else:
             explainer = shap.KernelExplainer(
-                model.predict_proba if hasattr(model, 'predict_proba') else model.predict,
+                inner_model.predict_proba
+                if hasattr(inner_model, "predict_proba")
+                else inner_model.predict,
                 X_background,
             )
             shap_values = explainer.shap_values(X_explain)
-            logger.info(f"  SHAP KernelExplainer created; computed {len(shap_values)} samples")
+            logger.info("  SHAP KernelExplainer created; computed %d samples", len(shap_values))
 
         return explainer, shap_values
     except Exception as e:
-        logger.warning(f"SHAP explanation failed ({e}); skipping")
+        logger.warning("SHAP explanation failed (%s); skipping", e)
         return None
 
 
@@ -1539,12 +1699,81 @@ def find_best_threshold(
             best_score = score
             best_t = t
             best_metrics = {
-                'precision': float(p),
-                'recall': float(r),
-                'f_beta': float((1 + beta**2) * (p * r) / (beta**2 * p + r + eps)),
+                "precision": float(p),
+                "recall": float(r),
+                "f_beta": float((1 + beta**2) * (p * r) / (beta**2 * p + r + eps)),
             }
 
     return float(best_t), float(best_score), best_metrics
+
+
+def find_cost_optimal_threshold(
+    y_true: np.ndarray,
+    y_proba: np.ndarray,
+    fn_cost: float,
+    fp_cost: float,
+) -> Tuple[float, float, Dict[str, float]]:
+    """
+    Choose threshold that minimizes expected cost:
+        cost = fn_cost * P(fraud) * FNR + fp_cost * P(non-fraud) * FPR
+    """
+    eps = 1e-9
+    fpr, tpr, thresholds = roc_curve(y_true, y_proba)
+    frac_pos = float(y_true.mean())
+    frac_neg = 1.0 - frac_pos
+
+    fnr = 1.0 - tpr
+    costs = fn_cost * frac_pos * fnr + fp_cost * frac_neg * fpr
+
+    best_idx = int(np.argmin(costs))
+    best_t = float(thresholds[best_idx])
+    best_cost = float(costs[best_idx])
+
+    best_metrics = {
+        "fpr": float(fpr[best_idx]),
+        "tpr": float(tpr[best_idx]),
+        "fnr": float(fnr[best_idx]),
+        "cost": best_cost,
+        "prevalence": frac_pos,
+    }
+
+    return best_t, best_cost, best_metrics
+
+
+def find_threshold_for_target_alert_rate(
+    y_true: np.ndarray,
+    y_proba: np.ndarray,
+    target_alert_rate: float,
+) -> Tuple[float, Dict[str, float]]:
+    """
+    Choose threshold so that approximately target_alert_rate of cases are flagged.
+
+    This is useful when business has a fixed analyst capacity per day.
+    """
+    eps = 1e-9
+    n = len(y_proba)
+    k = max(1, int(n * target_alert_rate))
+    sorted_scores = np.sort(y_proba)[::-1]
+    t = float(sorted_scores[min(k - 1, n - 1)])
+
+    pred = (y_proba >= t).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y_true, pred).ravel()
+    precision = tp / (tp + fp + eps) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn + eps) if (tp + fn) > 0 else 0.0
+
+    f_beta = (1 + 1.0**2) * precision * recall / (1.0**2 * precision + recall + eps) if (precision + recall) > 0 else 0.0  # F1
+
+    alert_rate = pred.mean()
+
+    metrics = {
+        "precision": float(precision),
+        "recall": float(recall),
+        "f_beta": float(f_beta),
+        "alert_rate": float(alert_rate),
+        "k": int(k),
+        "threshold": t,
+    }
+    return t, metrics
 
 
 def precision_recall_at_k(
@@ -1564,6 +1793,50 @@ def precision_recall_at_k(
     return k, float(prec_k), float(recall_k)
 
 
+# ------------------------------------------------------------------------------
+# Probability calibration helper
+# ------------------------------------------------------------------------------
+
+def maybe_calibrate_model(
+    model,
+    X_calib,
+    y_calib,
+    cfg: Config,
+    model_name: str,
+):
+    """
+    Optionally wrap a classifier with CalibratedClassifierCV using the validation set
+    as calibration data (cv='prefit').
+
+    This adjusts probability outputs so they better match real-world prevalence
+    while keeping the underlying classifier fixed.
+    """
+    if not getattr(cfg, "use_probability_calibration", False):
+        return model, None
+
+    method = getattr(cfg, "calibration_method", "sigmoid")
+    logger.info(
+        "[CALIBRATION] Calibrating %s probabilities using method='%s' on validation set",
+        model_name,
+        method,
+    )
+    try:
+        calib = CalibratedClassifierCV(model, method=method, cv="prefit")
+        calib.fit(X_calib, y_calib)
+        return calib, {"method": method}
+    except Exception as e:
+        logger.warning(
+            "Calibration for %s failed (%s); using raw model probabilities",
+            model_name,
+            e,
+        )
+        return model, None
+
+
+# ------------------------------------------------------------------------------
+# Evaluation
+# ------------------------------------------------------------------------------
+
 def evaluate_model(
     name: str,
     model,
@@ -1578,7 +1851,7 @@ def evaluate_model(
     Comprehensive model evaluation with multiple metrics, threshold tuning, and explainability.
     """
     logger.info("=" * 70)
-    logger.info(f"Evaluating model: {name}")
+    logger.info("Evaluating model: %s", name)
 
     # Extract probabilities
     if hasattr(model, "predict_proba"):
@@ -1601,34 +1874,83 @@ def evaluate_model(
     test_ap = average_precision_score(y_test, test_proba)
 
     logger.info(
-        f"[{name}] Validation AUC={val_auc:.4f}, PR-AUC={val_ap:.4f} | "
-        f"Test AUC={test_auc:.4f}, PR-AUC={test_ap:.4f}"
+        "[%s] Validation AUC=%.4f, PR-AUC=%.4f | Test AUC=%.4f, PR-AUC=%.4f",
+        name,
+        val_auc,
+        val_ap,
+        test_auc,
+        test_ap,
     )
     val_percentiles = np.percentile(val_proba, [50, 75, 90, 95, 99, 99.5, 99.9])
     test_percentiles = np.percentile(test_proba, [50, 75, 90, 95, 99, 99.5, 99.9])
     logger.info(
-        f"[{name}] Val proba percentiles P50..P99.9: {val_percentiles.tolist()}"
+        "[%s] Val proba percentiles P50..P99.9: %s",
+        name,
+        val_percentiles.tolist(),
     )
     logger.info(
-        f"[{name}] Test proba percentiles P50..P99.9: {test_percentiles.tolist()}"
+        "[%s] Test proba percentiles P50..P99.9: %s",
+        name,
+        test_percentiles.tolist(),
     )
 
-    # Enhanced threshold tuning with configurable metric
+    # Threshold strategy
+    threshold_strategy = getattr(cfg, "threshold_strategy", "metric").lower()
     threshold_metric = getattr(cfg, "threshold_metric", "f_beta")
-    best_t, best_score, threshold_metrics = find_best_threshold(
-        y_val,
-        val_proba,
-        beta=cfg.f_beta,
-        metric=threshold_metric,
-    )
-    logger.info(
-        f"[{name}] Best threshold ({threshold_metric} on val) = {best_t:.4f}, "
-        f"{threshold_metric}={best_score:.4f}"
-    )
-    logger.info(
-        f"  └─ Precision={threshold_metrics.get('precision', 0.0):.4f}, "
-        f"Recall={threshold_metrics.get('recall', 0.0):.4f}"
-    )
+
+    if threshold_strategy == "cost":
+        best_t, best_cost, threshold_metrics = find_cost_optimal_threshold(
+            y_val,
+            val_proba,
+            fn_cost=getattr(cfg, "fn_cost", 10.0),
+            fp_cost=getattr(cfg, "fp_cost", 1.0),
+        )
+        best_score = -best_cost  # higher is better convention
+        logger.info(
+            "[%s] Best threshold (cost-based on val) = %.4f, cost=%.6f, "
+            "FPR=%.4f, TPR=%.4f",
+            name,
+            best_t,
+            best_cost,
+            threshold_metrics.get("fpr", 0.0),
+            threshold_metrics.get("tpr", 0.0),
+        )
+    elif threshold_strategy == "volume" and getattr(cfg, "target_alert_rate", None) is not None:
+        best_t, threshold_metrics = find_threshold_for_target_alert_rate(
+            y_val,
+            val_proba,
+            cfg.target_alert_rate,
+        )
+        best_score = threshold_metrics.get("f_beta", 0.0)
+        logger.info(
+            "[%s] Best threshold (volume-based on val) = %.4f, alert_rate=%.4f, "
+            "precision=%.4f, recall=%.4f",
+            name,
+            best_t,
+            threshold_metrics.get("alert_rate", 0.0),
+            threshold_metrics.get("precision", 0.0),
+            threshold_metrics.get("recall", 0.0),
+        )
+    else:
+        best_t, best_score, threshold_metrics = find_best_threshold(
+            y_val,
+            val_proba,
+            beta=cfg.f_beta,
+            metric=threshold_metric,
+        )
+        logger.info(
+            "[%s] Best threshold (%s on val) = %.4f, %s=%.4f",
+            name,
+            threshold_metric,
+            best_t,
+            threshold_metric,
+            best_score,
+        )
+        logger.info(
+            "  └─ Precision=%.4f, Recall=%.4f",
+            threshold_metrics.get("precision", 0.0),
+            threshold_metrics.get("recall", 0.0),
+        )
 
     # Apply threshold and compute detailed metrics
     val_pred = (val_proba >= best_t).astype(int)
@@ -1643,26 +1965,39 @@ def evaluate_model(
     test_recall = recall_score(y_test, test_pred, zero_division=0)
 
     logger.info(
-        f"[{name}] Test Metrics: F1={test_f1:.4f}, Precision={test_precision:.4f}, Recall={test_recall:.4f}"
+        "[%s] Test Metrics: F1=%.4f, Precision=%.4f, Recall=%.4f",
+        name,
+        test_f1,
+        test_precision,
+        test_recall,
     )
 
     # Confusion matrix analysis
     tn, fp, fn, tp = confusion_matrix(y_test, test_pred).ravel()
     specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
     logger.info(
-        f"[{name}] Confusion Matrix: TP={tp}, FP={fp}, FN={fn}, TN={tn} | "
-        f"Specificity={specificity:.4f}"
+        "[%s] Confusion Matrix: TP=%d, FP=%d, FN=%d, TN=%d | Specificity=%.4f",
+        name,
+        tp,
+        fp,
+        fn,
+        tn,
+        specificity,
     )
 
     if cfg.verbose_reports:
-        logger.info(f"[{name}] Classification report (Test):")
-        logger.info("\n" + classification_report(y_test, test_pred, digits=3))
+        logger.info("[%s] Classification report (Test):", name)
+        logger.info("\n%s", classification_report(y_test, test_pred, digits=3))
 
     # Precision@K metrics
     k, prec_k, rec_k = precision_recall_at_k(y_test, test_proba, frac=cfg.top_k_frac)
     logger.info(
-        f"[{name}] Precision@top-{cfg.top_k_frac*100:.1f}% (K={k}): "
-        f"precision={prec_k:.4f}, recall={rec_k:.4f}"
+        "[%s] Precision@top-%.1f%% (K=%d): precision=%.4f, recall=%.4f",
+        name,
+        cfg.top_k_frac * 100,
+        k,
+        prec_k,
+        rec_k,
     )
 
     # Feature importance
@@ -1696,6 +2031,8 @@ def evaluate_model(
         "confusion_matrix": {"TP": int(tp), "FP": int(fp), "FN": int(fn), "TN": int(tn)},
         "importance_df": importance_df,
         "shap_result": shap_result,
+        "threshold_strategy": threshold_strategy,
+        "threshold_metrics_val": threshold_metrics,
     }
 
     return metrics
@@ -1726,7 +2063,7 @@ def train_random_forest(
     n_fraud = (y_train == 1).sum()
     n_non_fraud = (y_train == 0).sum()
     fraud_weight = n_non_fraud / (n_fraud + 1e-8) if n_fraud > 0 else 1.0
-    logger.info(f"  Class weights: fraud={fraud_weight:.2f}, non-fraud=1.0 (auto-balanced)")
+    logger.info("  Class weights: fraud=%.2f, non-fraud=1.0 (auto-balanced)", fraud_weight)
 
     rf = RandomForestClassifier(
         n_estimators=chunk if warm else total_trees,
@@ -1750,21 +2087,26 @@ def train_random_forest(
         trees_built = target_trees
         duration = time.time() - start
 
-        if hasattr(rf, 'predict_proba'):
+        if hasattr(rf, "predict_proba"):
             val_proba = rf.predict_proba(X_val)[:, 1]
             val_auc = roc_auc_score(y_val, val_proba)
             logger.info(
-                f"  -> RandomForest progress: {trees_built}/{total_trees} trees "
-                f"(val AUC={val_auc:.4f}, {duration:.1f}s)"
+                "  -> RandomForest progress: %d/%d trees "
+                "(val AUC=%.4f, %.1fs)",
+                trees_built,
+                total_trees,
+                val_auc,
+                duration,
             )
         else:
             logger.info(
-                f"  -> RandomForest progress: {trees_built}/{total_trees} trees ({duration:.1f}s)"
+                "  -> RandomForest progress: %d/%d trees (%.1fs)",
+                trees_built,
+                total_trees,
+                duration,
             )
 
-    logger.info(
-        f"RandomForest training complete in {time.time() - overall_start:.1f}s"
-    )
+    logger.info("RandomForest training complete in %.1fs", time.time() - overall_start)
     return rf
 
 
@@ -1786,18 +2128,18 @@ def train_xgboost(
     logger.info("=" * 70)
     logger.info("Training XGBoostClassifier with optional class weighting (no grid search)")
 
-    # Compute class imbalance statistics
+    # Compute class imbalance statistics on TRAIN SAMPLE (after downsampling)
     n_fraud = (y_train == 1).sum()
     n_non_fraud = (y_train == 0).sum()
     raw_ratio = float(n_non_fraud) / float(n_fraud + 1e-8) if n_fraud > 0 else 1.0
-    logger.info(f"  Observed class imbalance ratio (non-fraud / fraud): {raw_ratio:.2f}")
+    logger.info("  Observed class imbalance ratio (non-fraud / fraud): %.2f", raw_ratio)
 
     if getattr(cfg, "xgb_use_class_weight", False):
         scale_pos_weight = min(raw_ratio, getattr(cfg, "xgb_scale_pos_clip", raw_ratio))
-        logger.info(f"  Using scale_pos_weight={scale_pos_weight:.2f}")
+        logger.info("  Using scale_pos_weight=%.2f", scale_pos_weight)
     else:
         scale_pos_weight = 1.0
-        logger.info(f"  Not using class weighting; scale_pos_weight={scale_pos_weight:.2f}")
+        logger.info("  Not using class weighting; scale_pos_weight=%.2f", scale_pos_weight)
 
     xgb = XGBClassifier(
         n_estimators=500,
@@ -1848,7 +2190,7 @@ def run_pipeline(cfg: Config) -> Dict[str, Dict[str, Any]]:
     logger.info("=" * 70)
     logger.info("TECHM FRAUD DETECTION PIPELINE - GOD TIER LOCAL VERSION")
     logger.info("=" * 70)
-    logger.info(f"Config: {json.dumps({k: str(v) for k, v in asdict(cfg).items()}, indent=2)}")
+    logger.info("Config:\n%s", json.dumps({k: str(v) for k, v in asdict(cfg).items()}, indent=2))
 
     # Ensure data dir exists
     cfg.data_dir.mkdir(parents=True, exist_ok=True)
@@ -1865,11 +2207,14 @@ def run_pipeline(cfg: Config) -> Dict[str, Dict[str, Any]]:
     # 4. Merge and label
     merged = merge_trx_and_ecm(df_trx_clean, df_ecm_clean, cfg)
 
-    # 5. Split train/val/test
+    # 5. Split train/val/test (VAL/TEST remain at real-world prevalence)
     train_df, val_df, test_df = split_train_val_test(merged, cfg)
 
-    # 6. Feature engineering
-    train_fe, val_fe, test_fe = engineer_features(train_df, val_df, test_df, cfg)
+    # 6. Feature engineering (stats computed from FULL train_df)
+    train_fe_full, val_fe, test_fe = engineer_features(train_df, val_df, test_df, cfg)
+
+    # 6b. For model training, build a TRAIN SAMPLE with higher fraud rate
+    train_fe = make_training_sample(train_fe_full, cfg)
 
     # 7. Build feature matrices (categorical → numeric encoding: OHE + target encoding)
     (
@@ -1896,23 +2241,26 @@ def run_pipeline(cfg: Config) -> Dict[str, Dict[str, Any]]:
             elif name == "cat":
                 if hasattr(transformer.named_steps.get("ohe"), "get_feature_names_out"):
                     try:
-                        ohe_names = transformer.named_steps["ohe"].get_feature_names_out(columns)
+                        ohe_names = transformer.named_steps["ohe"].get_feature_names_out(
+                            columns
+                        )
                         feature_names.extend(ohe_names)
                     except Exception:
                         feature_names.extend(columns)
                 else:
                     feature_names.extend(columns)
 
-    logger.info(f"[STEP] Final feature matrix has {len(feature_names)} features")
+    logger.info("[STEP] Final feature matrix has %d features", len(feature_names))
 
     results: Dict[str, Dict[str, Any]] = {}
 
     # 9. Train & evaluate RandomForest
     logger.info("\n[TRAIN] RandomForest Model")
     rf = train_random_forest(X_train_rf, y_train_rf, X_val, y_val, cfg)
+    rf_calibrated, _ = maybe_calibrate_model(rf, X_val, y_val, cfg, "RandomForest")
     rf_metrics = evaluate_model(
         "RandomForest",
-        rf,
+        rf_calibrated,
         X_val,
         y_val,
         X_test,
@@ -1926,9 +2274,10 @@ def run_pipeline(cfg: Config) -> Dict[str, Dict[str, Any]]:
     logger.info("\n[TRAIN] XGBoost Model")
     xgb = train_xgboost(X_train_boost, y_train_boost, X_val, y_val, cfg)
     if xgb is not None:
+        xgb_calibrated, _ = maybe_calibrate_model(xgb, X_val, y_val, cfg, "XGBoost")
         xgb_metrics = evaluate_model(
             "XGBoost",
-            xgb,
+            xgb_calibrated,
             X_val,
             y_val,
             X_test,
@@ -1942,7 +2291,7 @@ def run_pipeline(cfg: Config) -> Dict[str, Dict[str, Any]]:
     logger.info("=" * 70)
     logger.info("PIPELINE EXECUTION COMPLETE!")
     logger.info("=" * 70)
-    logger.info(f"Models trained: {list(results.keys())}")
+    logger.info("Models trained: %s", list(results.keys()))
 
     # Decide what metric to use for "best model"
     ranking_metric = "test_auc"  # you can switch to "precision_at_k" or another key in metrics
@@ -1954,14 +2303,14 @@ def run_pipeline(cfg: Config) -> Dict[str, Dict[str, Any]]:
         )
         best_metrics = results[best_model_name]
         logger.info("\n[BEST MODEL] Summary:")
-        logger.info(f"  Model: {best_model_name}")
-        logger.info(f"  Ranking metric ({ranking_metric}): {best_metrics.get(ranking_metric, 0):.4f}")
-        logger.info(f"  Test AUC: {best_metrics.get('test_auc', 0):.4f}")
-        logger.info(f"  Test PR-AUC: {best_metrics.get('test_ap', 0):.4f}")
-        logger.info(f"  Test F1: {best_metrics.get('test_f1', 0):.4f}")
-        logger.info(f"  Test Precision: {best_metrics.get('test_precision', 0):.4f}")
-        logger.info(f"  Test Recall: {best_metrics.get('test_recall', 0):.4f}")
-        logger.info(f"  Optimal Threshold: {best_metrics.get('best_threshold', 0):.4f}")
+        logger.info("  Model: %s", best_model_name)
+        logger.info("  Ranking metric (%s): %.4f", ranking_metric, best_metrics.get(ranking_metric, 0))
+        logger.info("  Test AUC: %.4f", best_metrics.get("test_auc", 0))
+        logger.info("  Test PR-AUC: %.4f", best_metrics.get("test_ap", 0))
+        logger.info("  Test F1: %.4f", best_metrics.get("test_f1", 0))
+        logger.info("  Test Precision: %.4f", best_metrics.get("test_precision", 0))
+        logger.info("  Test Recall: %.4f", best_metrics.get("test_recall", 0))
+        logger.info("  Optimal Threshold: %.4f", best_metrics.get("best_threshold", 0))
 
     return results
 
@@ -1978,5 +2327,5 @@ if __name__ == "__main__":
         main()
         sys.exit(0)
     except Exception as e:
-        logger.error(f"Pipeline failed: {e}", exc_info=True)
+        logger.error("Pipeline failed: %s", e, exc_info=True)
         sys.exit(1)
