@@ -47,7 +47,7 @@ from preprocess import (
     logger,
 )
 from randomforest import train_random_forest
-from xgboost import train_xgboost
+from xgBoost import train_xgboost
 
 # Optional SHAP for explainability
 try:
