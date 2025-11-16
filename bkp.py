@@ -1963,7 +1963,7 @@ def train_xgboost(
         eval_metric="auc",
         tree_method="hist",
         n_jobs=-1,
-        scale_pos_weight=max(1.0, scale_pos_weight),
+        scale_pos_weight=1.0,
         random_state=cfg.random_state,
     )
 
