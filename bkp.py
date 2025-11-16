@@ -138,7 +138,7 @@ class Config:
     # "metric":     optimize cfg.threshold_metric (F_beta etc.)
     # "cost":       minimize expected cost given fn_cost / fp_cost
     # "alert_rate": fix alert volume via cfg.target_alert_rate
-    threshold_strategy: str = "alert_rate"
+    threshold_strategy: str = "metric"
     fn_cost: float = 10.0
     fp_cost: float = 1.0
     target_alert_rate: Optional[float] = 0.01  # e.g. 0.005 for 0.5% of tx flagged
@@ -2138,47 +2138,42 @@ def train_random_forest(
     return rf
 
 
-def train_xgboost(
-    X_train: np.ndarray,
-    y_train: np.ndarray,
-    X_val: np.ndarray,
-    y_val: np.ndarray,
-    cfg: Config,
-):
-    """
-    Train an XGBoost binary classifier with a sane default configuration,
-    optional class weighting, and validation-based early stopping.
-    """
+def train_xgboost(X_train, y_train, X_val, y_val, cfg: Config):
     if XGBClassifier is None:
         logger.warning("XGBoost not installed; skipping XGBoost model.")
         return None
 
     logger.info("=" * 70)
-    logger.info("Training XGBoostClassifier with optional class weighting (no grid search)")
+    logger.info("Training XGBoostClassifier with sane imbalance strategy")
 
-    # Compute class imbalance statistics on TRAIN SAMPLE (after downsampling)
     n_fraud = (y_train == 1).sum()
     n_non_fraud = (y_train == 0).sum()
     raw_ratio = float(n_non_fraud) / float(n_fraud + 1e-8) if n_fraud > 0 else 1.0
-    logger.info("  Observed class imbalance ratio (non-fraud / fraud): %.2f", raw_ratio)
+    logger.info(f"  Observed train class ratio (non-fraud / fraud): {raw_ratio:.2f}")
 
-    if getattr(cfg, "xgb_use_class_weight", False):
+    # If we've already resampled to ~2% fraud, DON'T use scale_pos_weight
+    if getattr(cfg, "train_target_fraud_rate", None) is not None:
+        scale_pos_weight = 1.0
+        logger.info(
+            "  train_target_fraud_rate is set; disabling scale_pos_weight to avoid double compensation"
+        )
+    elif getattr(cfg, "xgb_use_class_weight", False):
         scale_pos_weight = min(raw_ratio, getattr(cfg, "xgb_scale_pos_clip", raw_ratio))
-        logger.info("  Using scale_pos_weight=%.2f", scale_pos_weight)
+        logger.info(f"  Using scale_pos_weight={scale_pos_weight:.2f}")
     else:
         scale_pos_weight = 1.0
-        logger.info("  Not using class weighting; scale_pos_weight=%.2f", scale_pos_weight)
+        logger.info("  Not using class weighting; scale_pos_weight=1.00")
 
     xgb = XGBClassifier(
-        n_estimators=500,
+        n_estimators=300,
         learning_rate=0.05,
-        max_depth=6,
-        min_child_weight=10,
+        max_depth=4,
+        min_child_weight=20,
         subsample=0.8,
         colsample_bytree=0.8,
         gamma=0.0,
-        reg_alpha=0.0,
-        reg_lambda=1.0,
+        reg_alpha=0.5,
+        reg_lambda=2.0,
         objective="binary:logistic",
         eval_metric="auc",
         tree_method="hist",
@@ -2187,23 +2182,9 @@ def train_xgboost(
         random_state=cfg.random_state,
     )
 
-    logger.info("Training XGBoost with early stopping on validation set (50 rounds)")
-    try:
-        xgb.fit(
-            X_train,
-            y_train,
-            eval_set=[(X_val, y_val)],
-            early_stopping_rounds=50,
-            verbose=False,
-        )
-        if hasattr(xgb, "best_iteration") and xgb.best_iteration is not None:
-            logger.info("XGBoost best_iteration=%s", xgb.best_iteration)
-    except Exception as e:
-        logger.warning("Early stopping API failed (%s); training XGBoost without it", e)
-        xgb.fit(X_train, y_train)
-
+    logger.info("Training XGBoost (no early stopping; version limitation)")
+    xgb.fit(X_train, y_train)
     return xgb
-
 
 # ------------------------------------------------------------------------------
 # Orchestration
