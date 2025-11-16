@@ -1946,7 +1946,7 @@ def train_xgboost(
     # Compute class weights for XGBoost
     n_fraud = (y_train == 1).sum()
     n_non_fraud = (y_train == 0).sum()
-    scale_pos_weight = n_non_fraud / (n_fraud + 1e-8) if n_fraud > 0 else 1.0
+    scale_pos_weight = 1.0
     logger.info(f"  Class imbalance ratio (scale_pos_weight): {scale_pos_weight:.2f}")
 
     xgb = XGBClassifier(
