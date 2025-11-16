@@ -136,6 +136,7 @@ class Config:
     # Threshold tuning
     f_beta: float = 1.0          # F1; can set to >1 for recall-heavy F2
     top_k_frac: float = 0.01     # precision@top 1% of scores
+    threshold_metric: str = "f_beta"  # which metric find_best_threshold optimizes
 
     # Imbalance handling
     use_smote_tomek: bool = False
@@ -851,6 +852,7 @@ def resample_train_val_combined_after_encoding(
     cfg: Config,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
+    UNUSED helper kept for reference:
     Apply SMOTE to combined train+val AFTER feature encoding (on numeric data only).
 
     This is the best approach for extreme class imbalance because:
@@ -1364,7 +1366,7 @@ def resample_training_data(
         return _log_and_return(X_res, y_res, "RandomOverSampler")
     except Exception as e:
         logger.warning(f"RandomOverSampler failed ({e}); returning original training data")
-        logger.warning("WARNING: Model will train on original highly imbalanced data with only 4 fraud cases!")
+        logger.warning("WARNING: Model will train on original highly imbalanced data (no synthetic oversampling)!")
         return X_train, y_train
 
 
@@ -1687,10 +1689,21 @@ def evaluate_model(
         f"[{name}] Validation AUC={val_auc:.4f}, PR-AUC={val_ap:.4f} | "
         f"Test AUC={test_auc:.4f}, PR-AUC={test_ap:.4f}"
     )
+    val_percentiles = np.percentile(val_proba, [50, 75, 90, 95, 99, 99.5, 99.9])
+    test_percentiles = np.percentile(test_proba, [50, 75, 90, 95, 99, 99.5, 99.9])
+    logger.info(
+        f"[{name}] Val proba percentiles P50..P99.9: {val_percentiles.tolist()}"
+    )
+    logger.info(
+        f"[{name}] Test proba percentiles P50..P99.9: {test_percentiles.tolist()}"
+    )
 
     # Enhanced threshold tuning with multiple metrics
     best_t, best_f_beta, threshold_metrics = find_best_threshold(
-        y_val, val_proba, beta=cfg.f_beta, metric="f_beta"
+        y_val,
+        val_proba,
+        beta=cfg.f_beta,
+        metric=getattr(cfg, "threshold_metric", "f_beta"),
     )
     logger.info(
         f"[{name}] Best threshold (F_{cfg.f_beta:.1f} on val) = {best_t:.4f}, "
@@ -1946,7 +1959,7 @@ def train_xgboost(
     # Compute class weights for XGBoost
     n_fraud = (y_train == 1).sum()
     n_non_fraud = (y_train == 0).sum()
-    scale_pos_weight = 1.0
+    scale_pos_weight = float(n_non_fraud) / float(n_fraud) if n_fraud > 0 else 1.0
     logger.info(f"  Class imbalance ratio (scale_pos_weight): {scale_pos_weight:.2f}")
 
     xgb = XGBClassifier(
@@ -1963,7 +1976,7 @@ def train_xgboost(
         eval_metric="auc",
         tree_method="hist",
         n_jobs=-1,
-        scale_pos_weight=1.0,
+        scale_pos_weight=scale_pos_weight,
         random_state=cfg.random_state,
     )
 
@@ -2035,7 +2048,9 @@ def run_pipeline(cfg: Config) -> Dict[str, Dict[str, Any]]:
         preprocess_pipeline,
     ) = build_feature_matrix(train_fe, val_fe, test_fe, cfg)
 
-    # 8. Apply SMOTE ONLY for RandomForest; boosting models stay on original distribution
+    # 8. Imbalance handling (model-specific):
+    #    - RandomForest: optional SMOTE/Tomek/ROS via resample_training_data
+    #    - Boosting models: keep original distribution; rely on class weights
     X_train_rf, y_train_rf = resample_training_data(X_train, y_train, cfg)
     X_train_boost, y_train_boost = X_train, y_train
 
@@ -2116,7 +2131,7 @@ def run_pipeline(cfg: Config) -> Dict[str, Dict[str, Any]]:
 
     # Find best model by test AUC
     if results:
-        best_model_name = max(results.keys(), key=lambda x: results[x].get("test_auc", 0))
+        best_model_name = max(results.keys(), key=lambda x: results[x].get("test_ap", 0))
         best_metrics = results[best_model_name]
         logger.info("\n[BEST MODEL] Summary:")
         logger.info(f"  Model: {best_model_name}")
