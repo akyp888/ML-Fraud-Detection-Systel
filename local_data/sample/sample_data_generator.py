@@ -512,6 +512,10 @@ def build_destination_accounts(n_destinations: int) -> List[Dict[str, Any]]:
     for idx in range(n_destinations):
         country = random_country_code()
         location = pick_location(country)
+        if random.random() < 0.05:
+            fraud_bias = random.uniform(2.0, 3.5)
+        else:
+            fraud_bias = 0.0
         dests.append(
             {
                 "account_no": f"DST-{idx:07d}",
@@ -521,6 +525,7 @@ def build_destination_accounts(n_destinations: int) -> List[Dict[str, Any]]:
                 "branch": f"{location['city']} Branch",
                 "risk_score": random.uniform(0.1, 0.9),
                 "weight": random.uniform(0.5, 3.0),
+                "fraud_bias": fraud_bias,
             }
         )
     return dests
@@ -823,6 +828,9 @@ def generate_datasets(
     trx_path = out_dir / "transactions.jsonl"
     ecm_path = out_dir / "ecm.jsonl"
 
+    trimmed_ratio = min(max(fraud_ratio, 1e-6), 0.999999)
+    base_logit = math.log(trimmed_ratio / (1 - trimmed_ratio))
+
     # Build populations
     n_customers = max(200, n_transactions // 5)
     n_destinations = max(100, n_transactions // 10)
@@ -840,6 +848,18 @@ def generate_datasets(
         }
         for cust in customers
     }
+
+    # Latent entity-level risk biases
+    device_risk_bias: Dict[str, float] = {}
+    ip_risk_bias: Dict[str, float] = {}
+    phone_risk_bias: Dict[str, float] = {}
+    email_risk_bias: Dict[str, float] = {}
+
+    def get_bias(key: str, store: Dict[str, float], evil_prob: float, low: float, high: float) -> float:
+        """Assign or reuse a persistent latent risk bias for an entity."""
+        if key not in store:
+            store[key] = random.uniform(low, high) if random.random() < evil_prob else 0.0
+        return store[key]
 
     trx_fields = list(TRX_FIELD_TYPES.keys())
     ecm_fields = list(ECM_FIELD_TYPES.keys())
@@ -869,6 +889,13 @@ def generate_datasets(
         is_new_dest = dest["account_no"] not in history["seen_destinations"]
         history["seen_destinations"].add(dest["account_no"])
 
+        # Latent entity biases (shared across dataset)
+        device_bias = get_bias(device_id, device_risk_bias, evil_prob=0.05, low=2.0, high=3.0)
+        ip_bias = get_bias(ip_address, ip_risk_bias, evil_prob=0.03, low=1.5, high=2.5)
+        phone_bias = get_bias(phone, phone_risk_bias, evil_prob=0.03, low=1.5, high=2.5)
+        email_bias = get_bias(email, email_risk_bias, evil_prob=0.03, low=1.5, high=2.5)
+        dest_bias = dest.get("fraud_bias", 0.0)
+
         trx_dt = sample_transaction_datetime(profile["night_owl_prob"])
         trx_date_int = int(trx_dt.strftime('%Y%m%d'))
         trx_hour = trx_dt.hour
@@ -887,16 +914,22 @@ def generate_datasets(
         is_night = trx_hour < 6 or trx_hour >= 23
         is_international = dest["country"] != profile["home_country"]
 
-        # Behaviour-driven fraud risk (used only for ranking)
+        # Behaviour + latent entity risk (used only for ranking)
         z = (
-            0.9 * log_amount_centered
-            + 1.2 * int(is_new_device)
-            + 0.8 * int(is_new_ip)
-            + 1.0 * int(is_new_dest)
-            + 0.6 * int(is_night)
-            + 0.75 * int(is_international)
+            0.7 * log_amount_centered
+            + 0.4 * int(is_new_device)
+            + 0.3 * int(is_new_ip)
+            + 0.3 * int(is_new_dest)
+            + 0.5 * int(is_night)
+            + 0.6 * int(is_international)
             + 0.7 * (dest["risk_score"] - 0.5)
-            + random.gauss(0, 0.35)
+            + device_bias
+            + ip_bias
+            + phone_bias
+            + email_bias
+            + dest_bias
+            + base_logit
+            + random.gauss(0, 0.3)
         )
         fraud_risk = sigmoid(z)
 
