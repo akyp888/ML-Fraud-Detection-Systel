@@ -13,7 +13,6 @@ for fraud detection. It is designed to:
 - Handle extreme class imbalance with advanced resampling (SMOTE-Tomek, etc.)
 - Train multiple tree-based models with regularization:
     - RandomForest (scikit-learn)
-    - LightGBM (optional, if installed)
     - XGBoost (optional, if installed)
 - Tune probability thresholds based on validation F1/F2 and Precision-Recall
 - Evaluate on a held-out test set, including precision@K
@@ -22,7 +21,7 @@ It is intentionally "god tier": heavily instrumented, modular, and robust agains
 messy data. You can later adapt the same ideas to Spark / cluster scale.
 
 Requirements (recommended):
-    pip install pandas numpy scikit-learn imbalanced-learn lightgbm xgboost
+    pip install pandas numpy scikit-learn imbalanced-learn xgboost
 
 Usage:
     python techm_local_pipeline.py
@@ -62,11 +61,6 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_selection import SelectFromModel, mutual_info_classif
 
 # Optional dependencies --------------------------------------------------------
-try:
-    from lightgbm import LGBMClassifier  # type: ignore
-except Exception:
-    LGBMClassifier = None
-
 try:
     from xgboost import XGBClassifier  # type: ignore
 except Exception:
@@ -149,6 +143,10 @@ class Config:
     rf_n_estimators: int = 200
     rf_warm_start_chunk: int = 50
     rf_n_jobs: int = -1
+
+    # XGBoost controls
+    xgb_use_class_weight: bool = False
+    xgb_scale_pos_clip: float = 50.0
 
     # Encoding / feature controls
     target_encode_whitelist: Tuple[str, ...] = tuple(
@@ -309,15 +307,15 @@ def make_data_messy(
     ]
     for col in noisy_cols:
         if col in df_trx.columns:
-            mask = rng.rand(len(df_trx)) < 0.03  # 3% missing
+            mask = np.random.rand(len(df_trx)) < 0.03  # 3% missing
             df_trx.loc[mask, col] = np.nan
 
     # 2. Perturb transaction amounts
     if cfg.trx_amount_col in df_trx.columns:
         amt = df_trx[cfg.trx_amount_col].copy()
         amt = pd.to_numeric(amt, errors="coerce")
-        noise_mask = rng.rand(len(amt)) < 0.15  # 15% rows get noisy
-        noise_factor = rng.lognormal(mean=0.0, sigma=0.75, size=noise_mask.sum())
+        noise_mask = np.random.rand(len(amt)) < 0.15  # 15% rows get noisy
+        noise_factor = np.random.lognormal(mean=0.0, sigma=0.75, size=noise_mask.sum())
         amt.loc[noise_mask] = amt.loc[noise_mask] * noise_factor
         df_trx[cfg.trx_amount_col] = amt
 
@@ -332,7 +330,7 @@ def make_data_messy(
     ]
     for col in cat_cols:
         if col in df_trx.columns:
-            weird_mask = rng.rand(len(df_trx)) < 0.02  # 2%
+            weird_mask = np.random.rand(len(df_trx)) < 0.02  # 2%
             df_trx.loc[weird_mask, col] = "ZZZ_UNKNOWN_" + col
 
     # 4. Mutate ECM label strings (mixed case, synonyms)
@@ -347,20 +345,20 @@ def make_data_messy(
         def randomize_state(s: str) -> str:
             s_up = s.strip().upper()
             if "FRAUD" in s_up:
-                return rng.choice(variants["FRAUD"])
+                return np.random.choice(variants["FRAUD"])
             elif "GENUINE" in s_up or "LEGIT" in s_up:
-                return rng.choice(variants["GENUINE"])
+                return np.random.choice(variants["GENUINE"])
             else:
                 # occasionally flip or make it weird
-                if rng.rand() < 0.5:
-                    return rng.choice(variants["FRAUD"] + variants["GENUINE"])
+                if np.random.rand() < 0.5:
+                    return np.random.choice(variants["FRAUD"] + variants["GENUINE"])
                 return s
 
         df_ecm[cfg.ecm_label_col] = ecm.apply(randomize_state)
 
     # 5. Duplicate a small % of transactions to simulate duplicates
     if len(df_trx) > 0:
-        dup_mask = rng.rand(len(df_trx)) < 0.01  # 1%
+        dup_mask = np.random.rand(len(df_trx)) < 0.01  # 1%
         dup_rows = df_trx[dup_mask]
         if not dup_rows.empty:
             df_trx = pd.concat([df_trx, dup_rows], ignore_index=True)
@@ -759,7 +757,6 @@ def compute_entity_fraud_stats(
         [entity_col, entity_col + "_FRAUD_COUNT", "_TOTAL_COUNT", "_FRAUD_RATE"]
     """
     stats_dict: Dict[str, pd.DataFrame] = {}
-    y = train[cfg.label_col].astype(int)
 
     for col in entity_cols:
         if col not in train.columns:
@@ -925,15 +922,12 @@ def resample_train_val_combined_after_encoding(
     )
 
     # Shuffle resampled data before re-splitting
-    # SMOTE generates synthetic samples at the end, causing all fraud to end up in one split
-    # Shuffling ensures fraud cases are distributed across train and val
     shuffle_idx = np.random.RandomState(cfg.random_state).permutation(new_total_size)
     X_resampled = X_resampled[shuffle_idx]
     y_resampled = y_resampled[shuffle_idx]
     logger.info(f"  Shuffled resampled data to distribute fraud cases evenly")
 
     # Re-split back into train/val using original proportions
-    # Calculate train/val split point based on original proportions
     train_fraction = original_train_size / total_size
     split_point = int(train_fraction * new_total_size)
 
@@ -1156,14 +1150,13 @@ def build_feature_matrix(
         logger.info(f"Applied target encoding to {len(target_encode_cols)} columns")
 
     # Rebuild feature columns list after target encoding
-    # (target-encoded columns are added, original high-cardinality columns are dropped)
     feature_cols = [
         c for c in train_fe.columns
         if c not in exclude_cols and c not in target_encode_cols and c not in drop_cols
     ]
 
     # Re-identify numeric vs categorical after target encoding
-    numeric_cols: List[str] = []
+    numeric_cols = []
     categorical_cols_final: List[str] = []
     for col in feature_cols:
         if pd.api.types.is_numeric_dtype(train_fe[col]):
@@ -1177,7 +1170,6 @@ def build_feature_matrix(
     numeric_transformer = Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="median")),
-            # Tree models don't strictly need scaling; we keep raw scale.
         ]
     )
 
@@ -1207,7 +1199,6 @@ def build_feature_matrix(
         ]
     )
 
-    # Build full pipeline with a placeholder classifier (we'll fit separate models)
     model_pipeline = Pipeline(
         steps=[
             ("preprocessor", preprocessor),
@@ -1261,10 +1252,6 @@ def resample_training_data(
     Apply advanced imbalance handling with adaptive k_neighbors for small minority classes.
 
     Preferred: SMOTE-Tomek with BorderlineSMOTE (focusing on decision boundary).
-    Features:
-        - Adaptive k_neighbors: Reduces k_neighbors when minority samples are very few
-        - Fallbacks for small minority classes
-        - Pure SMOTE if TomekLinks fails
     """
 
     if not cfg.use_smote_tomek:
@@ -1307,7 +1294,6 @@ def resample_training_data(
                 X_clean, y_clean = tomek.fit_resample(X_smote, y_smote)
                 fraud_after_tomek = int(y_clean.sum())
 
-                # Verify TomekLinks didn't remove all synthetic samples
                 if fraud_after_tomek > n_minority:
                     logger.info(f"✓ BorderlineSMOTE created {fraud_after_smote} fraud, TomekLinks refined to {fraud_after_tomek}")
                     return _log_and_return(X_clean, y_clean, "BorderlineSMOTE + TomekLinks")
@@ -1315,7 +1301,6 @@ def resample_training_data(
                     logger.warning(f"TomekLinks removed too many samples ({fraud_after_tomek} fraud); skipping")
                     return None
 
-            # Check if SMOTE alone created synthetic samples
             if fraud_after_smote > n_minority:
                 logger.info(f"✓ BorderlineSMOTE created synthetic fraud: {n_minority} → {fraud_after_smote}")
                 return _log_and_return(X_smote, y_smote, "BorderlineSMOTE")
@@ -1340,9 +1325,9 @@ def resample_training_data(
             logger.warning("SMOTE not available; using original training data")
             return X_train, y_train
 
-    # Fallback: Try pure SMOTE with k_neighbors=1 (minimum for synthetic generation)
+    # Fallback: Try pure SMOTE with k_neighbors=1
     try:
-        smote_k = max(1, min(k_neighbors, 1))  # Use k_neighbors=1 for maximum compatibility
+        smote_k = max(1, min(k_neighbors, 1))
         logger.info(f"Applying pure SMOTE with k_neighbors={smote_k}...")
         smote_estimator = SMOTE(k_neighbors=smote_k, random_state=cfg.random_state)
         X_res, y_res = smote_estimator.fit_resample(X_train, y_train)
@@ -1382,21 +1367,9 @@ def select_important_features(
 ) -> Tuple[np.ndarray, np.ndarray, List[str]]:
     """
     Select important features using SelectFromModel with a RandomForest estimator.
-
-    Args:
-        X_train: Training feature matrix
-        y_train: Training labels
-        feature_names: Names of features
-        threshold: Feature selection threshold (default "median" for robustness)
-
-    Returns:
-        X_selected: Filtered feature matrix
-        selected_mask: Boolean mask of selected features
-        selected_names: Names of selected features
     """
     logger.info("[STEP] Feature Selection based on RandomForest importance")
 
-    # Train a RandomForest to estimate feature importance
     rf_selector = RandomForestClassifier(
         n_estimators=100,
         max_depth=10,
@@ -1406,7 +1379,6 @@ def select_important_features(
     )
     rf_selector.fit(X_train, y_train)
 
-    # Use SelectFromModel for feature selection
     selector = SelectFromModel(
         rf_selector,
         prefit=True,
@@ -1436,25 +1408,14 @@ def compute_feature_importance(
 ) -> pd.DataFrame:
     """
     Compute and rank feature importance from a trained model.
-
-    Args:
-        model: Trained model (RandomForest, XGBoost, LightGBM)
-        feature_names: Names of features
-        importance_type: Type of importance ("weight", "gain", "cover" for XGBoost)
-        top_k: Number of top features to return
-
-    Returns:
-        DataFrame with feature names and importance scores, sorted by importance
     """
     logger.info(f"[STEP] Computing feature importance ({importance_type})")
 
     importances = None
 
     if hasattr(model, 'feature_importances_'):
-        # RandomForest, LightGBM
         importances = model.feature_importances_
     elif hasattr(model, 'get_booster'):
-        # XGBoost
         booster = model.get_booster()
         importance_dict = booster.get_score(importance_type=importance_type)
         importances = np.zeros(len(feature_names))
@@ -1471,14 +1432,13 @@ def compute_feature_importance(
         logger.warning("Could not compute feature importance; model type not supported")
         return pd.DataFrame()
 
-    # Create importance DataFrame
     importance_df = pd.DataFrame({
         'feature': feature_names,
         'importance': importances,
     }).sort_values('importance', ascending=False)
 
     logger.info(f"  Top {top_k} features:")
-    for idx, row in importance_df.head(top_k).iterrows():
+    for _, row in importance_df.head(top_k).iterrows():
         logger.info(f"    {row['feature']}: {row['importance']:.6f}")
 
     return importance_df
@@ -1493,16 +1453,6 @@ def explain_model_with_shap(
 ) -> Optional[Any]:
     """
     Generate SHAP explanations for model predictions.
-
-    Args:
-        model: Trained model
-        X_sample: Sample to explain (shape: [n_samples, n_features])
-        X_background: Background dataset for SHAP (default: random subset of X_sample)
-        model_name: Name of model for logging
-        max_samples: Maximum number of samples to explain
-
-    Returns:
-        SHAP Explainer object, or None if SHAP not available
     """
     if not SHAP_AVAILABLE:
         logger.warning("SHAP not installed; skipping model explainability analysis")
@@ -1510,7 +1460,6 @@ def explain_model_with_shap(
 
     logger.info(f"[STEP] Computing SHAP explanations for {model_name}")
 
-    # Use random subset if sample is large
     if len(X_sample) > max_samples:
         indices = np.random.choice(len(X_sample), max_samples, replace=False)
         X_explain = X_sample[indices]
@@ -1518,7 +1467,6 @@ def explain_model_with_shap(
     else:
         X_explain = X_sample
 
-    # Use background data for SHAP
     if X_background is None:
         n_background = min(100, len(X_sample) // 2)
         bg_indices = np.random.choice(len(X_sample), n_background, replace=False)
@@ -1526,14 +1474,11 @@ def explain_model_with_shap(
         logger.info(f"  Using {n_background} background samples for SHAP")
 
     try:
-        # Create SHAP explainer
         if hasattr(model, 'predict_proba'):
-            # Use TreeExplainer for tree-based models
             explainer = shap.TreeExplainer(model)
             shap_values = explainer.shap_values(X_explain)
             logger.info(f"  SHAP TreeExplainer created; computed {len(shap_values)} samples")
         else:
-            # Fallback to KernelExplainer
             explainer = shap.KernelExplainer(
                 model.predict_proba if hasattr(model, 'predict_proba') else model.predict,
                 X_background,
@@ -1561,22 +1506,13 @@ def find_best_threshold(
     Find the probability threshold that optimizes a specified metric.
 
     Supports optimization by F-beta, PR-AUC, or balanced accuracy.
-
-    Args:
-        y_true: True labels
-        y_proba: Predicted probabilities
-        beta: Beta parameter for F-beta score (default 1.0 for F1)
-        metric: Metric to optimize ("f_beta", "pr_auc", "balanced_accuracy")
-
-    Returns:
-        Tuple of (best_threshold, best_score, metrics_dict)
     """
     precision, recall, thresholds = precision_recall_curve(y_true, y_proba)
     thresholds = np.append(thresholds, 1.0)  # align lengths
 
     best_t = 0.5
     best_score = -1.0
-    best_metrics = {}
+    best_metrics: Dict[str, float] = {}
     eps = 1e-9
 
     for p, r, t in zip(precision, recall, thresholds):
@@ -1586,7 +1522,6 @@ def find_best_threshold(
         if metric == "f_beta":
             score = (1 + beta**2) * (p * r) / (beta**2 * p + r + eps)
         elif metric == "pr_auc":
-            # Approximate PR-AUC by summing trapezoids
             score = average_precision_score(y_true, y_proba)
         elif metric == "balanced_accuracy":
             pred = (y_proba >= t).astype(int)
@@ -1641,26 +1576,6 @@ def evaluate_model(
 ) -> Dict[str, Any]:
     """
     Comprehensive model evaluation with multiple metrics, threshold tuning, and explainability.
-
-    Enhanced features:
-    - Multiple threshold optimization metrics (F-beta, PR-AUC, balanced accuracy)
-    - Feature importance ranking
-    - SHAP explainability (if available)
-    - Detailed confusion matrix analysis
-    - Precision@K metrics
-
-    Args:
-        name: Model name
-        model: Trained model
-        X_val: Validation features
-        y_val: Validation labels
-        X_test: Test features
-        y_test: Test labels
-        cfg: Configuration object
-        feature_names: List of feature names (for importance analysis)
-
-    Returns:
-        Dictionary of comprehensive metrics
     """
     logger.info("=" * 70)
     logger.info(f"Evaluating model: {name}")
@@ -1698,19 +1613,22 @@ def evaluate_model(
         f"[{name}] Test proba percentiles P50..P99.9: {test_percentiles.tolist()}"
     )
 
-    # Enhanced threshold tuning with multiple metrics
-    best_t, best_f_beta, threshold_metrics = find_best_threshold(
+    # Enhanced threshold tuning with configurable metric
+    threshold_metric = getattr(cfg, "threshold_metric", "f_beta")
+    best_t, best_score, threshold_metrics = find_best_threshold(
         y_val,
         val_proba,
         beta=cfg.f_beta,
-        metric=getattr(cfg, "threshold_metric", "f_beta"),
+        metric=threshold_metric,
     )
     logger.info(
-        f"[{name}] Best threshold (F_{cfg.f_beta:.1f} on val) = {best_t:.4f}, "
-        f"F_{cfg.f_beta:.1f}={best_f_beta:.4f}"
+        f"[{name}] Best threshold ({threshold_metric} on val) = {best_t:.4f}, "
+        f"{threshold_metric}={best_score:.4f}"
     )
-    logger.info(f"  └─ Precision={threshold_metrics['precision']:.4f}, "
-                f"Recall={threshold_metrics['recall']:.4f}")
+    logger.info(
+        f"  └─ Precision={threshold_metrics.get('precision', 0.0):.4f}, "
+        f"Recall={threshold_metrics.get('recall', 0.0):.4f}"
+    )
 
     # Apply threshold and compute detailed metrics
     val_pred = (val_proba >= best_t).astype(int)
@@ -1736,7 +1654,6 @@ def evaluate_model(
         f"Specificity={specificity:.4f}"
     )
 
-    # Verbose reports
     if cfg.verbose_reports:
         logger.info(f"[{name}] Classification report (Test):")
         logger.info("\n" + classification_report(y_test, test_pred, digits=3))
@@ -1753,12 +1670,11 @@ def evaluate_model(
     if feature_names:
         importance_df = compute_feature_importance(model, feature_names)
 
-    # SHAP explanability
+    # SHAP explainability
     shap_result = None
     if feature_names:
         shap_result = explain_model_with_shap(model, X_test[:100], model_name=name)
 
-    # Comprehensive metrics dict
     metrics = {
         "name": name,
         "val_auc": val_auc,
@@ -1773,7 +1689,7 @@ def evaluate_model(
         "test_recall": test_recall,
         "test_specificity": specificity,
         "best_threshold": best_t,
-        "best_f_beta_val": best_f_beta,
+        "best_threshold_metric_val": best_score,
         "precision_at_k": prec_k,
         "recall_at_k": rec_k,
         "k": k,
@@ -1797,12 +1713,7 @@ def train_random_forest(
     cfg: Config,
 ):
     """
-    Train a regularized RandomForestClassifier with class weighting and cross-validation.
-
-    Features:
-    - Class weight balancing to handle imbalance
-    - Warm-start training for gradual tree growth
-    - Max depth and min samples controls to prevent overfitting
+    Train a regularized RandomForestClassifier with class weighting and warm-starting.
     """
     logger.info("=" * 70)
     logger.info("Training RandomForestClassifier (regularized + class weighting)")
@@ -1824,7 +1735,7 @@ def train_random_forest(
         min_samples_leaf=20,
         max_features="sqrt",
         n_jobs=cfg.rf_n_jobs,
-        class_weight="balanced_subsample",  # Automatically balance class weights at each split
+        class_weight="balanced_subsample",
         random_state=cfg.random_state,
         warm_start=warm,
     )
@@ -1839,7 +1750,6 @@ def train_random_forest(
         trees_built = target_trees
         duration = time.time() - start
 
-        # Compute validation AUC for monitoring
         if hasattr(rf, 'predict_proba'):
             val_proba = rf.predict_proba(X_val)[:, 1]
             val_auc = roc_auc_score(y_val, val_proba)
@@ -1858,86 +1768,6 @@ def train_random_forest(
     return rf
 
 
-def train_lightgbm(
-    X_train,
-    y_train,
-    X_val,
-    y_val,
-    cfg: Config,
-):
-    """
-    Train a LightGBM model with early stopping, regularization, and class weighting.
-
-    Features:
-    - Balanced class weighting for imbalanced data
-    - Early stopping based on validation AUC
-    - L1/L2 regularization to prevent overfitting
-    """
-    if LGBMClassifier is None:
-        logger.warning("LightGBM not installed; skipping LGBM model.")
-        return None
-
-    logger.info("=" * 70)
-    logger.info("Training LightGBMClassifier (regularized + class weighting + early stopping)")
-
-    # Log class weights
-    n_fraud = (y_train == 1).sum()
-    n_non_fraud = (y_train == 0).sum()
-    fraud_weight = n_non_fraud / (n_fraud + 1e-8) if n_fraud > 0 else 1.0
-    logger.info(f"  Class weights: fraud={fraud_weight:.2f}, non-fraud=1.0 (auto-balanced)")
-
-    lgbm = LGBMClassifier(
-        n_estimators=500,
-        learning_rate=0.05,
-        num_leaves=64,
-        max_depth=-1,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_alpha=0.0,
-        reg_lambda=1.0,
-        min_child_samples=40,
-        objective="binary",
-        class_weight="balanced",
-        random_state=cfg.random_state,
-        n_jobs=-1,
-        verbose=-1,
-    )
-
-    callbacks = []
-    try:
-        from lightgbm import early_stopping
-
-        callbacks.append(early_stopping(stopping_rounds=50))
-        logger.info("Using LightGBM callbacks API for early stopping (50 rounds)")
-    except (ImportError, TypeError):
-        logger.info("LightGBM callback early stopping unavailable; trying legacy API")
-
-    try:
-        if callbacks:
-            lgbm.fit(
-                X_train,
-                y_train,
-                eval_set=[(X_val, y_val)],
-                eval_metric="auc",
-                callbacks=callbacks,
-            )
-        else:
-            lgbm.fit(
-                X_train,
-                y_train,
-                eval_set=[(X_val, y_val)],
-                eval_metric="auc",
-                early_stopping_rounds=50,
-            )
-        if hasattr(lgbm, "best_iteration_") and lgbm.best_iteration_ is not None:
-            logger.info("LightGBM best iteration: %s", lgbm.best_iteration_)
-    except TypeError:
-        logger.warning("Early stopping arguments unsupported; training LightGBM without it")
-        lgbm.fit(X_train, y_train)
-
-    return lgbm
-
-
 def train_xgboost(
     X_train: np.ndarray,
     y_train: np.ndarray,
@@ -1947,20 +1777,27 @@ def train_xgboost(
 ):
     """
     Train an XGBoost binary classifier with a sane default configuration,
-    class weighting, and validation-based early stopping.
+    optional class weighting, and validation-based early stopping.
     """
     if XGBClassifier is None:
         logger.warning("XGBoost not installed; skipping XGBoost model.")
         return None
 
     logger.info("=" * 70)
-    logger.info("Training XGBoostClassifier with balanced class weights (no grid search)")
+    logger.info("Training XGBoostClassifier with optional class weighting (no grid search)")
 
-    # Compute class weights for XGBoost
+    # Compute class imbalance statistics
     n_fraud = (y_train == 1).sum()
     n_non_fraud = (y_train == 0).sum()
-    scale_pos_weight = float(n_non_fraud) / float(n_fraud) if n_fraud > 0 else 1.0
-    logger.info(f"  Class imbalance ratio (scale_pos_weight): {scale_pos_weight:.2f}")
+    raw_ratio = float(n_non_fraud) / float(n_fraud + 1e-8) if n_fraud > 0 else 1.0
+    logger.info(f"  Observed class imbalance ratio (non-fraud / fraud): {raw_ratio:.2f}")
+
+    if getattr(cfg, "xgb_use_class_weight", False):
+        scale_pos_weight = min(raw_ratio, getattr(cfg, "xgb_scale_pos_clip", raw_ratio))
+        logger.info(f"  Using scale_pos_weight={scale_pos_weight:.2f}")
+    else:
+        scale_pos_weight = 1.0
+        logger.info(f"  Not using class weighting; scale_pos_weight={scale_pos_weight:.2f}")
 
     xgb = XGBClassifier(
         n_estimators=500,
@@ -1991,7 +1828,6 @@ def train_xgboost(
         )
         if hasattr(xgb, "best_iteration") and xgb.best_iteration is not None:
             logger.info("XGBoost best_iteration=%s", xgb.best_iteration)
-
     except Exception as e:
         logger.warning("Early stopping API failed (%s); training XGBoost without it", e)
         xgb.fit(X_train, y_train)
@@ -2023,9 +1859,7 @@ def run_pipeline(cfg: Config) -> Dict[str, Dict[str, Any]]:
     # 2. Normalize types
     df_trx_clean, df_ecm_clean = clean_and_normalize_raw(df_trx_raw, df_ecm_raw, cfg)
 
-    # 3. [REMOVED] Make data messy/noisy - use clean sample data as-is
-    # Previously: df_trx_messy, df_ecm_messy = make_data_messy(df_trx_clean, df_ecm_clean, cfg, rng)
-    # Now: Use clean data directly to preserve sample data integrity
+    # 3. Use clean sample data (no intentional corruption)
     logger.info("[STEP] Using clean sample data (skipped intentional data corruption)")
 
     # 4. Merge and label
@@ -2048,21 +1882,18 @@ def run_pipeline(cfg: Config) -> Dict[str, Dict[str, Any]]:
         preprocess_pipeline,
     ) = build_feature_matrix(train_fe, val_fe, test_fe, cfg)
 
-    # 8. Imbalance handling (model-specific):
-    #    - RandomForest: optional SMOTE/Tomek/ROS via resample_training_data
-    #    - Boosting models: keep original distribution; rely on class weights
+    # 8. Imbalance handling:
     X_train_rf, y_train_rf = resample_training_data(X_train, y_train, cfg)
     X_train_boost, y_train_boost = X_train, y_train
 
     # Extract feature names for importance analysis and explainability
     preprocessor = preprocess_pipeline.named_steps["preprocessor"]
-    feature_names = []
+    feature_names: List[str] = []
     if hasattr(preprocessor, "transformers_"):
         for name, transformer, columns in preprocessor.transformers_:
             if name == "num":
                 feature_names.extend(columns)
             elif name == "cat":
-                # Get OHE feature names
                 if hasattr(transformer.named_steps.get("ohe"), "get_feature_names_out"):
                     try:
                         ohe_names = transformer.named_steps["ohe"].get_feature_names_out(columns)
@@ -2091,23 +1922,7 @@ def run_pipeline(cfg: Config) -> Dict[str, Dict[str, Any]]:
     )
     results["RandomForest"] = rf_metrics
 
-    # 10. Train & evaluate LightGBM
-    logger.info("\n[TRAIN] LightGBM Model")
-    lgbm = train_lightgbm(X_train_boost, y_train_boost, X_val, y_val, cfg)
-    if lgbm is not None:
-        lgbm_metrics = evaluate_model(
-            "LightGBM",
-            lgbm,
-            X_val,
-            y_val,
-            X_test,
-            y_test,
-            cfg,
-            feature_names=feature_names,
-        )
-        results["LightGBM"] = lgbm_metrics
-
-    # 11. Train & evaluate XGBoost
+    # 10. Train & evaluate XGBoost
     logger.info("\n[TRAIN] XGBoost Model")
     xgb = train_xgboost(X_train_boost, y_train_boost, X_val, y_val, cfg)
     if xgb is not None:
@@ -2123,18 +1938,24 @@ def run_pipeline(cfg: Config) -> Dict[str, Dict[str, Any]]:
         )
         results["XGBoost"] = xgb_metrics
 
-    # 12. Summary and best model selection
+    # 11. Summary and best model selection
     logger.info("=" * 70)
     logger.info("PIPELINE EXECUTION COMPLETE!")
     logger.info("=" * 70)
     logger.info(f"Models trained: {list(results.keys())}")
 
-    # Find best model by test AUC
+    # Decide what metric to use for "best model"
+    ranking_metric = "test_auc"  # you can switch to "precision_at_k" or another key in metrics
+
     if results:
-        best_model_name = max(results.keys(), key=lambda x: results[x].get("test_ap", 0))
+        best_model_name = max(
+            results.keys(),
+            key=lambda name: results[name].get(ranking_metric, 0.0),
+        )
         best_metrics = results[best_model_name]
         logger.info("\n[BEST MODEL] Summary:")
         logger.info(f"  Model: {best_model_name}")
+        logger.info(f"  Ranking metric ({ranking_metric}): {best_metrics.get(ranking_metric, 0):.4f}")
         logger.info(f"  Test AUC: {best_metrics.get('test_auc', 0):.4f}")
         logger.info(f"  Test PR-AUC: {best_metrics.get('test_ap', 0):.4f}")
         logger.info(f"  Test F1: {best_metrics.get('test_f1', 0):.4f}")
