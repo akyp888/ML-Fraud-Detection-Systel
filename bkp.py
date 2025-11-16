@@ -138,7 +138,7 @@ class Config:
     top_k_frac: float = 0.01     # precision@top 1% of scores
 
     # Imbalance handling
-    use_smote_tomek: bool = True
+    use_smote_tomek: bool = False
     smote_kind: str = "borderline"  # or "regular"
 
     # Misc
