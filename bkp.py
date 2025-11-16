@@ -135,13 +135,13 @@ class Config:
     threshold_metric: str = "f_beta"  # which metric find_best_threshold optimizes
 
     # Threshold strategy / business constraints
-    # "metric": optimize cfg.threshold_metric (F_beta etc.)
-    # "cost":   minimize expected cost given fn_cost / fp_cost
-    # "volume": fix alert volume via cfg.target_alert_rate
-    threshold_strategy: str = "metric"
+    # "metric":     optimize cfg.threshold_metric (F_beta etc.)
+    # "cost":       minimize expected cost given fn_cost / fp_cost
+    # "alert_rate": fix alert volume via cfg.target_alert_rate
+    threshold_strategy: str = "alert_rate"
     fn_cost: float = 10.0
     fp_cost: float = 1.0
-    target_alert_rate: Optional[float] = None  # e.g. 0.005 for 0.5% of tx flagged
+    target_alert_rate: Optional[float] = 0.01  # e.g. 0.005 for 0.5% of tx flagged
 
     # Probability calibration
     use_probability_calibration: bool = False
@@ -1915,7 +1915,7 @@ def evaluate_model(
             threshold_metrics.get("fpr", 0.0),
             threshold_metrics.get("tpr", 0.0),
         )
-    elif threshold_strategy == "volume" and getattr(cfg, "target_alert_rate", None) is not None:
+    elif threshold_strategy in {"alert_rate", "volume"} and getattr(cfg, "target_alert_rate", None) is not None:
         best_t, threshold_metrics = find_threshold_for_target_alert_rate(
             y_val,
             val_proba,
@@ -1923,7 +1923,7 @@ def evaluate_model(
         )
         best_score = threshold_metrics.get("f_beta", 0.0)
         logger.info(
-            "[%s] Best threshold (volume-based on val) = %.4f, alert_rate=%.4f, "
+            "[%s] Best threshold (alert-rate on val) = %.4f, alert_rate=%.4f, "
             "precision=%.4f, recall=%.4f",
             name,
             best_t,
@@ -1972,16 +1972,35 @@ def evaluate_model(
         test_recall,
     )
 
-    # Confusion matrix analysis
-    tn, fp, fn, tp = confusion_matrix(y_test, test_pred).ravel()
-    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+    # Confusion matrix analysis (val + test)
+    val_tn, val_fp, val_fn, val_tp = confusion_matrix(y_val, val_pred).ravel()
+    test_tn, test_fp, test_fn, test_tp = confusion_matrix(y_test, test_pred).ravel()
+    eps = 1e-9
+    val_fpr = val_fp / (val_fp + val_tn + eps)
+    test_fpr = test_fp / (test_fp + test_tn + eps)
+    val_trr = (val_tp + val_fp) / max(1, len(y_val))
+    test_trr = (test_tp + test_fp) / max(1, len(y_test))
+    specificity = test_tn / (test_tn + test_fp + eps)
+
     logger.info(
-        "[%s] Confusion Matrix: TP=%d, FP=%d, FN=%d, TN=%d | Specificity=%.4f",
+        "[%s] Validation Confusion: TP=%d, FP=%d, FN=%d, TN=%d | VFPR=%.6f, TRR=%.6f",
         name,
-        tp,
-        fp,
-        fn,
-        tn,
+        val_tp,
+        val_fp,
+        val_fn,
+        val_tn,
+        val_fpr,
+        val_trr,
+    )
+    logger.info(
+        "[%s] Test Confusion: TP=%d, FP=%d, FN=%d, TN=%d | TFPR=%.6f, TRR=%.6f, Specificity=%.4f",
+        name,
+        test_tp,
+        test_fp,
+        test_fn,
+        test_tn,
+        test_fpr,
+        test_trr,
         specificity,
     )
 
@@ -2023,12 +2042,21 @@ def evaluate_model(
         "test_precision": test_precision,
         "test_recall": test_recall,
         "test_specificity": specificity,
+        "val_fpr": val_fpr,
+        "test_fpr": test_fpr,
+        "val_trr": val_trr,
+        "test_trr": test_trr,
         "best_threshold": best_t,
         "best_threshold_metric_val": best_score,
         "precision_at_k": prec_k,
         "recall_at_k": rec_k,
         "k": k,
-        "confusion_matrix": {"TP": int(tp), "FP": int(fp), "FN": int(fn), "TN": int(tn)},
+        "confusion_matrix": {
+            "TP": int(test_tp),
+            "FP": int(test_fp),
+            "FN": int(test_fn),
+            "TN": int(test_tn),
+        },
         "importance_df": importance_df,
         "shap_result": shap_result,
         "threshold_strategy": threshold_strategy,
