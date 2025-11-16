@@ -68,15 +68,21 @@ def train_xgboost(
     raw_ratio = float(n_non_fraud) / float(n_fraud + 1e-8) if n_fraud > 0 else 1.0
     logger.info("  Observed train class ratio (non-fraud / fraud): %.2f", raw_ratio)
 
-    # If we've already resampled to ~2% fraud, DON'T use scale_pos_weight
-    if getattr(cfg, "train_target_fraud_rate", None) is not None:
+    use_full = getattr(cfg, "use_full_train_for_xgb", False)
+    if use_full:
+        scale_pos_weight = raw_ratio
+        logger.info(
+            "  Using full training distribution for XGBoost; scale_pos_weight=%.2f",
+            scale_pos_weight,
+        )
+    elif getattr(cfg, "train_target_fraud_rate", None) is not None:
         scale_pos_weight = 1.0
         logger.info(
             "  train_target_fraud_rate is set; disabling scale_pos_weight to avoid double compensation"
         )
     else:
         scale_pos_weight = raw_ratio
-        logger.info("  Using scale_pos_weight=%.2f", scale_pos_weight)
+        logger.info("  No train_target_fraud_rate; using scale_pos_weight=%.2f", scale_pos_weight)
 
     xgb = XGBClassifier(
         **XGB_PARAMS,

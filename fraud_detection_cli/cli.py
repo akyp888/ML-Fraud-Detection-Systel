@@ -490,6 +490,17 @@ def evaluate_model(
         prec_k,
         rec_k,
     )
+    # Additional diagnostics at 2% and 5% review capacities
+    for frac in (0.02, 0.05):
+        k_extra, prec_extra, rec_extra = precision_recall_at_k(y_test, test_proba, frac=frac)
+        logger.info(
+            "[%s] Precision@top-%.1f%% (K=%d): precision=%.4f, recall=%.4f",
+            name,
+            frac * 100,
+            k_extra,
+            prec_extra,
+            rec_extra,
+        )
 
     if feature_names:
         compute_feature_importance(model, feature_names)
@@ -520,6 +531,10 @@ def evaluate_model(
         "precision_at_k": float(prec_k),
         "recall_at_k": float(rec_k),
         "k": int(k),
+        "precision_at_top2pct": float(precision_recall_at_k(y_test, test_proba, frac=0.02)[1]),
+        "recall_at_top2pct": float(precision_recall_at_k(y_test, test_proba, frac=0.02)[2]),
+        "precision_at_top5pct": float(precision_recall_at_k(y_test, test_proba, frac=0.05)[1]),
+        "recall_at_top5pct": float(precision_recall_at_k(y_test, test_proba, frac=0.05)[2]),
         "confusion_matrix": {
             "TP": int(test_tp),
             "FP": int(test_fp),

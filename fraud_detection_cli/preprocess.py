@@ -95,7 +95,7 @@ class Config:
     threshold_strategy: str = "alert_rate"  # "metric", "cost", or "alert_rate"
     fn_cost: float = 10.0
     fp_cost: float = 1.0
-    target_alert_rate: Optional[float] = 0.01  # e.g. 0.005 for 0.5% of tx flagged
+    target_alert_rate: Optional[float] = 0.02  # e.g. 0.005 for 0.5% of tx flagged
 
     # Probability calibration
     use_probability_calibration: bool = False
@@ -107,7 +107,7 @@ class Config:
     max_nonfraud_train: Optional[int] = None
 
     # Imbalance handling on encoded train data
-    use_smote_tomek: bool = True
+    use_smote_tomek: bool = False
     smote_kind: str = "borderline"  # or "regular"
 
     # Training strategy
