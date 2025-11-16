@@ -92,7 +92,7 @@ class Config:
     f_beta: float = 2.0
     top_k_frac: float = 0.01
     threshold_metric: str = "f_beta"
-    threshold_strategy: str = "metric"  # "metric", "cost", or "alert_rate"
+    threshold_strategy: str = "alert_rate"  # "metric", "cost", or "alert_rate"
     fn_cost: float = 10.0
     fp_cost: float = 1.0
     target_alert_rate: Optional[float] = 0.01  # e.g. 0.005 for 0.5% of tx flagged
@@ -107,8 +107,11 @@ class Config:
     max_nonfraud_train: Optional[int] = None
 
     # Imbalance handling on encoded train data
-    use_smote_tomek: bool = False
+    use_smote_tomek: bool = True
     smote_kind: str = "borderline"  # or "regular"
+
+    # Training strategy
+    use_full_train_for_xgb: bool = True
 
     # Misc
     verbose_reports: bool = True
@@ -940,6 +943,7 @@ def build_feature_matrix(
     logger.info("  Low cardinality categorical (OHE): %d", len(low_card_ohe))
     logger.info("  High cardinality categorical (Target Encoding): %d", len(target_encode_cols))
 
+    target_stats: Dict[str, pd.DataFrame] = {}
     if target_encode_cols:
         logger.info("Computing target encoding (fraud rates) for high-cardinality columns...")
         target_stats = compute_target_encoding_stats(train_fe, cfg, target_encode_cols)
@@ -998,6 +1002,9 @@ def build_feature_matrix(
             ("preprocessor", preprocessor),
         ]
     )
+    # Store the feature column order for downstream transforms (e.g., using full training data)
+    setattr(model_pipeline, "feature_columns_", feature_cols)
+    setattr(model_pipeline, "target_encoding_stats_", target_stats)
 
     X_train = train_fe[feature_cols]
     y_train = train_fe[cfg.label_col].values.astype(int)

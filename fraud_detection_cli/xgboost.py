@@ -23,17 +23,17 @@ except Exception:
 
 # You can tune these directly in this file.
 XGB_PARAMS = dict(
-    n_estimators=300,
+    n_estimators=600,
     learning_rate=0.05,
     max_depth=4,
-    min_child_weight=20,
+    min_child_weight=1.0,
     subsample=0.8,
     colsample_bytree=0.8,
     gamma=0.0,
-    reg_alpha=0.5,
-    reg_lambda=2.0,
+    reg_alpha=0.0,
+    reg_lambda=1.0,
     objective="binary:logistic",
-    eval_metric="auc",
+    eval_metric="aucpr",
     tree_method="hist",
     n_jobs=-1,
 )

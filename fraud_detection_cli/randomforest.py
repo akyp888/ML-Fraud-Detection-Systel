@@ -19,12 +19,12 @@ from preprocess import Config, logger
 # ------------------------------------------------------------------------------
 
 # You can tune these directly in this file.
-RF_N_ESTIMATORS: int = 200
-RF_WARM_START_CHUNK: int = 50
+RF_N_ESTIMATORS: int = 400
+RF_WARM_START_CHUNK: int = 400
 RF_N_JOBS: int = -1
-RF_MAX_DEPTH: int = 10
-RF_MIN_SAMPLES_SPLIT: int = 50
-RF_MIN_SAMPLES_LEAF: int = 20
+RF_MAX_DEPTH: int = 8
+RF_MIN_SAMPLES_SPLIT: int = 10
+RF_MIN_SAMPLES_LEAF: int = 5
 RF_MAX_FEATURES: str = "sqrt"
 
 

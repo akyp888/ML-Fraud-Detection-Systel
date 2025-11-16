@@ -35,6 +35,7 @@ from sklearn.metrics import (
 from preprocess import (
     Config,
     apply_env_overrides,
+    apply_target_encoding,
     seed_everything,
     load_sample_jsonl,
     clean_and_normalize_raw,
@@ -583,9 +584,27 @@ def run_fraud_pipeline() -> Dict[str, Dict[str, Any]]:
         preprocess_pipeline,
     ) = build_feature_matrix(train_fe, val_fe, test_fe, cfg)
 
-    # 8. Imbalance handling
+    feature_cols = getattr(preprocess_pipeline, "feature_columns_", None)
+    target_stats = getattr(preprocess_pipeline, "target_encoding_stats_", {})
+    X_train_full_matrix = None
+    y_train_full_vector = None
+    if feature_cols is not None and getattr(cfg, "use_full_train_for_xgb", False):
+        logger.info("[STEP] Preparing full training matrix for XGBoost (no downsampling)")
+        train_full_for_boost = train_fe_full.copy()
+        if target_stats:
+            train_full_for_boost = apply_target_encoding(
+                train_full_for_boost, target_stats, default_rate=0.0
+            )
+        train_full_features = train_full_for_boost[feature_cols]
+        X_train_full_matrix = preprocess_pipeline.transform(train_full_features)
+        y_train_full_vector = train_full_for_boost[cfg.label_col].values.astype(int)
+
+    # 8. Imbalance handling / model-specific training matrices
     X_train_rf, y_train_rf = resample_training_data(X_train, y_train, cfg)
-    X_train_boost, y_train_boost = X_train, y_train
+    if getattr(cfg, "use_full_train_for_xgb", False) and X_train_full_matrix is not None:
+        X_train_boost, y_train_boost = X_train_full_matrix, y_train_full_vector
+    else:
+        X_train_boost, y_train_boost = X_train, y_train
 
     # 9. Extract feature names for importance analysis and explainability
     preprocessor = preprocess_pipeline.named_steps["preprocessor"]
