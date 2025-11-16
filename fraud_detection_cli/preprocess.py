@@ -103,7 +103,7 @@ class Config:
 
     # Real world prevalence + training sampling for ultra-rare fraud
     real_fraud_rate: Optional[float] = None
-    train_target_fraud_rate: float = 0.02  # 2% fraud in training sample
+    train_target_fraud_rate: Optional[float] = None  # downsample to target rate if set
     max_nonfraud_train: Optional[int] = None
 
     # Imbalance handling on encoded train data
@@ -580,6 +580,9 @@ def make_training_sample(
 
     orig_rate = n_pos / (n_pos + n_neg + 1e-9)
     target_rate = cfg.train_target_fraud_rate
+    if target_rate is None:
+        logger.info("train_target_fraud_rate is None; using full training data without downsampling.")
+        return df
     if target_rate <= 0 or target_rate >= 0.5:
         logger.info(
             "train_target_fraud_rate=%.4f is out of (0, 0.5); skipping train downsampling",

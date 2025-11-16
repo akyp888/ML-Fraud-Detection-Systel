@@ -23,15 +23,15 @@ except Exception:
 
 # You can tune these directly in this file.
 XGB_PARAMS = dict(
-    n_estimators=600,
+    n_estimators=400,
     learning_rate=0.05,
     max_depth=4,
     min_child_weight=1.0,
     subsample=0.8,
     colsample_bytree=0.8,
-    gamma=0.0,
+    gamma=0.1,
     reg_alpha=0.0,
-    reg_lambda=1.0,
+    reg_lambda=2.0,
     objective="binary:logistic",
     eval_metric="aucpr",
     tree_method="hist",
@@ -69,11 +69,13 @@ def train_xgboost(
     logger.info("  Observed train class ratio (non-fraud / fraud): %.2f", raw_ratio)
 
     use_full = getattr(cfg, "use_full_train_for_xgb", False)
+    max_scale = getattr(cfg, "max_scale_pos_weight", 200.0)
     if use_full:
-        scale_pos_weight = raw_ratio
+        scale_pos_weight = min(raw_ratio, max_scale)
         logger.info(
-            "  Using full training distribution for XGBoost; scale_pos_weight=%.2f",
+            "  Using full training distribution for XGBoost; scale_pos_weight capped at %.2f (raw=%.2f)",
             scale_pos_weight,
+            raw_ratio,
         )
     elif getattr(cfg, "train_target_fraud_rate", None) is not None:
         scale_pos_weight = 1.0
@@ -81,8 +83,8 @@ def train_xgboost(
             "  train_target_fraud_rate is set; disabling scale_pos_weight to avoid double compensation"
         )
     else:
-        scale_pos_weight = raw_ratio
-        logger.info("  No train_target_fraud_rate; using scale_pos_weight=%.2f", scale_pos_weight)
+        scale_pos_weight = min(raw_ratio, max_scale)
+        logger.info("  No train_target_fraud_rate; using scale_pos_weight=%.2f (raw=%.2f)", scale_pos_weight, raw_ratio)
 
     xgb = XGBClassifier(
         **XGB_PARAMS,
