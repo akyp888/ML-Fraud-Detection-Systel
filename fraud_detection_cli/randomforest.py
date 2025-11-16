@@ -26,6 +26,7 @@ RF_MAX_DEPTH: int = 8
 RF_MIN_SAMPLES_SPLIT: int = 10
 RF_MIN_SAMPLES_LEAF: int = 5
 RF_MAX_FEATURES: str = "sqrt"
+RF_MAX_POS_WEIGHT: float = 1000.0
 
 
 # ------------------------------------------------------------------------------
@@ -51,8 +52,14 @@ def train_random_forest(
 
     n_fraud = int((y_train == 1).sum())
     n_non_fraud = int((y_train == 0).sum())
-    fraud_weight = n_non_fraud / (n_fraud + 1e-8) if n_fraud > 0 else 1.0
-    logger.info("  Class weights: fraud=%.2f, non-fraud=1.0 (auto-balanced)", fraud_weight)
+    raw_ratio = n_non_fraud / (n_fraud + 1e-8) if n_fraud > 0 else 1.0
+    fraud_weight = min(raw_ratio, RF_MAX_POS_WEIGHT)
+    class_weight = {0: 1.0, 1: fraud_weight}
+    logger.info(
+        "  Class weights (capped): fraud=%.2f, non-fraud=1.0 | raw_ratio=%.2f",
+        fraud_weight,
+        raw_ratio,
+    )
 
     rf = RandomForestClassifier(
         n_estimators=chunk if warm else total_trees,
@@ -61,7 +68,7 @@ def train_random_forest(
         min_samples_leaf=RF_MIN_SAMPLES_LEAF,
         max_features=RF_MAX_FEATURES,
         n_jobs=RF_N_JOBS,
-        class_weight="balanced_subsample",
+        class_weight=class_weight,
         random_state=cfg.random_state,
         warm_start=warm,
     )
