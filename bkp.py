@@ -130,7 +130,7 @@ class Config:
     test_size: float = 0.15
 
     # Threshold tuning
-    f_beta: float = 1.0          # F1; can set to >1 for recall-heavy F2
+    f_beta: float = 2.0          # F1; can set to >1 for recall-heavy F2
     top_k_frac: float = 0.01     # precision@top 1% of scores
     threshold_metric: str = "f_beta"  # which metric find_best_threshold optimizes
 
@@ -167,7 +167,7 @@ class Config:
     rf_n_jobs: int = -1
 
     # XGBoost controls
-    xgb_use_class_weight: bool = False
+    xgb_use_class_weight: bool = True
     xgb_scale_pos_clip: float = 50.0
 
     # Encoding / feature controls
